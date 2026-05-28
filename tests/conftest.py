@@ -4,9 +4,20 @@ Test DB is strictly separate from the dev DB. The DATABASE_URL env
 var is overridden BEFORE any ``from app...`` import, so the cached
 ``Settings()`` instance picks up the test URL.
 
-Schema management arrives in Task 1.3 (alembic migrations). The
-engine fixture currently only verifies the connection — extending
-it to per-test transaction rollback is a 1.3 follow-up.
+Schema lifecycle:
+- Session start: drop+recreate public schema, drop vector extension,
+  then ``alembic upgrade head`` against the test DB. Guarantees we
+  test the migration, not stale state.
+- Per test: open a connection, begin a transaction, hand it to the
+  test as the ``db`` fixture, rollback at teardown. Tests can't bleed
+  state into each other.
+
+RLS testing: ``postgres`` is a SUPERUSER and superusers bypass RLS
+even with FORCE. The session fixture creates a ``decyra_app`` role
+(NOSUPERUSER, NOBYPASSRLS) with full DML on public schema. RLS-aware
+tests call ``SET LOCAL ROLE decyra_app`` inside their transaction to
+prove the policies actually fire. This mirrors what production will
+need (the API must not run as postgres).
 """
 
 from __future__ import annotations
@@ -22,9 +33,11 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 
 import pytest  # noqa: E402  (env override must happen first)
 import pytest_asyncio  # noqa: E402
+from alembic import command  # noqa: E402
+from alembic.config import Config as AlembicConfig  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 from sqlalchemy import create_engine, text  # noqa: E402
-from sqlalchemy.engine import Engine  # noqa: E402
+from sqlalchemy.engine import Connection, Engine  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
 from app.main import app  # noqa: E402
@@ -38,10 +51,43 @@ def engine() -> Iterator[Engine]:
         f"Got: {settings.database_url!r}"
     )
     eng = create_engine(settings.database_url, future=True)
-    with eng.connect() as conn:
-        conn.execute(text("SELECT 1"))
+
+    with eng.begin() as conn:
+        conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+        conn.execute(text("DROP EXTENSION IF EXISTS vector"))
+
+    alembic_cfg = AlembicConfig("alembic.ini")
+    command.upgrade(alembic_cfg, "head")
+
+    with eng.begin() as conn:
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'decyra_app') THEN
+                    CREATE ROLE decyra_app NOLOGIN NOSUPERUSER NOBYPASSRLS;
+                END IF;
+            END
+            $$;
+        """))
+        conn.execute(text("GRANT USAGE ON SCHEMA public TO decyra_app"))
+        conn.execute(
+            text("GRANT ALL ON ALL TABLES IN SCHEMA public TO decyra_app")
+        )
+
     yield eng
     eng.dispose()
+
+
+@pytest.fixture
+def db(engine: Engine) -> Iterator[Connection]:
+    connection = engine.connect()
+    transaction = connection.begin()
+    try:
+        yield connection
+    finally:
+        transaction.rollback()
+        connection.close()
 
 
 @pytest_asyncio.fixture
