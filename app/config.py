@@ -12,6 +12,10 @@ class Settings(BaseSettings):
 
     database_url: str
 
+    supabase_url: str | None = None
+    supabase_jwt_audience: str = "authenticated"
+    supabase_jwt_issuer: str | None = None  # defaults to f"{supabase_url}/auth/v1"
+
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
     mistral_api_key: str | None = None

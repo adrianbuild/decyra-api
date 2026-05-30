@@ -31,6 +31,16 @@
 - Bildgenerierung (5B.4): EU-Provider FLUX/Black Forest Labs — DPA und Souveränität vor Bau klären
 
 ## Letzte Session
+- 2026-05-30: Auth-Flow in UI ausgeblendet, Backend + Frontend-Routen
+  bleiben aktiv, jederzeit reaktivierbar durch Wiedereinfügen des
+  Links auf /. Magic-Link-zu-Email-Passwort-Umstellung verschoben.
+  - Konkret entfernt: `decyra-web/src/app/page.tsx` zurück auf statische
+    Server-Component (kein `async`, kein `getUser()`, keine Supabase-
+    Imports). Reaktivierung = Conditional-Block aus git-history holen.
+  - Unverändert: /login, /auth/callback, /dashboard, Logout-Button,
+    src/lib/supabase/*, src/middleware.ts, Backend komplett, alle
+    Tests (13/13 grün).
+
 - 2026-05-28: Task 1.3 abgeschlossen. Datenbank-Schema + Migrations in
   decyra-api komplett:
   - `alembic init alembic` (sync-Template). `alembic.ini` mit leerer

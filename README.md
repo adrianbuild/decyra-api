@@ -44,6 +44,24 @@ other database — strict isolation from dev data. The `engine` fixture
 verifies the connection at session start; per-test transaction
 rollback arrives once the schema lands in Task 1.3.
 
+## Auth (Task 2.1)
+
+Supabase JWTs are validated via the project's JWKS endpoint
+(`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`, ES256 / P-256).
+Public keys are cached in-process for 5 minutes.
+
+Required env vars:
+
+- `SUPABASE_URL` — your Supabase project URL.
+
+Optional overrides:
+
+- `SUPABASE_JWT_AUDIENCE` (default `authenticated`)
+- `SUPABASE_JWT_ISSUER` (default `{SUPABASE_URL}/auth/v1`)
+
+Protected example route: `GET /me` returns `{user_id, email}` for the
+caller, blocks with 401 without a valid Bearer token.
+
 ## Docker
 
 ```bash

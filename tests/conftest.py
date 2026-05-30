@@ -18,11 +18,20 @@ even with FORCE. The session fixture creates a ``decyra_app`` role
 tests call ``SET LOCAL ROLE decyra_app`` inside their transaction to
 prove the policies actually fire. This mirrors what production will
 need (the API must not run as postgres).
+
+Auth (JWKS/ES256):
+- A session-scoped ECC P-256 keypair stands in for Supabase's JWKS.
+  An autouse function-scope fixture monkeypatches
+  ``PyJWKClient.get_signing_key_from_jwt`` to return the test public
+  key, so ``decode_token`` exercises real ``jwt.decode`` (signature,
+  audience, issuer, expiry) without hitting the network.
+- The ``make_token`` fixture signs tokens with the session private key.
 """
 
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import AsyncIterator, Iterator
 
 TEST_DATABASE_URL = os.environ.get(
@@ -30,17 +39,22 @@ TEST_DATABASE_URL = os.environ.get(
     "postgresql://postgres:postgres@localhost:55432/decyra_test",
 )
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+os.environ.setdefault("SUPABASE_URL", "http://test-supabase.local")
 
+import jwt  # noqa: E402
 import pytest  # noqa: E402  (env override must happen first)
 import pytest_asyncio  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config as AlembicConfig  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.engine import Connection, Engine  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
 from app.main import app  # noqa: E402
+
+TEST_ISSUER = f"{get_settings().supabase_url}/auth/v1"
 
 
 @pytest.fixture(scope="session")
@@ -95,3 +109,66 @@ async def client() -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+
+
+# --- Auth test plumbing -------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def test_ec_private_key() -> ec.EllipticCurvePrivateKey:
+    """Single ECC P-256 keypair for the test session."""
+    return ec.generate_private_key(ec.SECP256R1())
+
+
+class _StubSigningKey:
+    def __init__(self, key) -> None:  # type: ignore[no-untyped-def]
+        self.key = key
+
+
+@pytest.fixture(autouse=True)
+def _patch_jwks(monkeypatch, test_ec_private_key):  # type: ignore[no-untyped-def]
+    """Make PyJWKClient.get_signing_key_from_jwt return the test public key.
+
+    Real jwt.decode still runs (signature, aud, iss, exp all checked),
+    only the JWKS-fetch step is short-circuited.
+    """
+    public_key = test_ec_private_key.public_key()
+
+    def _stub(self, token):  # type: ignore[no-untyped-def]
+        return _StubSigningKey(public_key)
+
+    monkeypatch.setattr(
+        jwt.PyJWKClient, "get_signing_key_from_jwt", _stub
+    )
+
+
+@pytest.fixture
+def make_token(test_ec_private_key):  # type: ignore[no-untyped-def]
+    """Mint a Supabase-shaped ES256 JWT for tests."""
+
+    def _make(
+        sub: str = "11111111-1111-1111-1111-111111111111",
+        email: str | None = "u@test.local",
+        exp_offset: int = 3600,
+        audience: str = "authenticated",
+        issuer: str = TEST_ISSUER,
+        signing_key: ec.EllipticCurvePrivateKey | None = None,
+    ) -> str:
+        now = int(time.time())
+        payload: dict[str, object] = {
+            "sub": sub,
+            "aud": audience,
+            "iss": issuer,
+            "iat": now,
+            "exp": now + exp_offset,
+            "role": "authenticated",
+        }
+        if email is not None:
+            payload["email"] = email
+        return jwt.encode(
+            payload,
+            signing_key or test_ec_private_key,
+            algorithm="ES256",
+        )
+
+    return _make
