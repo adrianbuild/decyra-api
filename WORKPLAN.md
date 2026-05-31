@@ -133,13 +133,14 @@
 ## TASK-BLOCK 4 — Modell-Routing, Chat-Proxy & PII
 
 ### Task 4.1 — LiteLLM & Provider-Anbindung
-- [ ] LiteLLM-Config: OpenAI (gpt-5, gpt-5-mini)
-- [ ] Anthropic (claude-sonnet-4-6, claude-haiku-4-5)
-- [ ] Google Vertex AI EU (gemini-3.5-flash)
-- [ ] Mistral La Plateforme (mistral-large-3, mistral-small)
-- [ ] models-Tabelle mit allen Modellen + aktuellen Preisen füllen (Seed-Migration)
-- [ ] Test-Skript: "Hello World" durch jeden der 7 Provider
-- **DoD:** alle 7 Modelle antworten korrekt
+- [x] LiteLLM-Config: OpenAI (gpt-5.5, gpt-5.4-mini)
+- [x] Anthropic (anthropic/claude-sonnet-4-6, anthropic/claude-haiku-4-5-20251001)
+- [ ] Google Vertex AI EU (vertex_ai/gemini-3.5-flash-tbd) — als Platzhalter mit enabled=false geseeded, Vertex-AI-EU-Zugang steht noch aus
+- [x] Mistral La Plateforme (mistral/mistral-large-latest, mistral/mistral-small-latest) — SOVEREIGN
+- [x] models-Tabelle mit allen Modellen + (Recherche-)Preisen gefüllt via idempotentem Seed (`python -m app.seed_models`, ON CONFLICT DO UPDATE) — KEINE Preise in Alembic-Migration
+- [x] Test-Skript: `scripts/test_providers.py` standalone (nicht in pytest, weil echte API-Calls)
+- **DoD Phase A:** Code + Seed + Test-Skript gebaut, 28/28 Tests grün, Migration appliziert
+- **DoD Phase B (User-Action nach Key-Eintrag, iterativ):** alle 6 aktiven Modelle antworten auf "Hello"; ggf. Model-IDs / Preise in `MODELS` korrigieren und re-seeden
 
 ### Task 4.2 — Minimales Test-Frontend (früh!)
 - [ ] Einfache Chat-Seite: Texteingabe, Senden, Antwort anzeigen, Modell-Dropdown

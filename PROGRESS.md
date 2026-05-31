@@ -3,14 +3,14 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 3 — Audit-Log mit Hash-Chain**: 3.2 abgeschlossen → als nächstes Block 4 (Routing/Chat/PII).
+**Block 4 — Routing/Chat/PII**: 4.1 Phase A abgeschlossen → als nächstes 4.1 Phase B (User trägt Provider-Keys ein und läuft `python scripts/test_providers.py`), dann 4.2 (Test-Frontend).
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
 - [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS, UI pausiert; [ ] 2.2/2.3/2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
-- [ ] Block 4 — Routing/Chat/PII (4.1 LiteLLM, 4.2 Test-Frontend, 4.3 Chat-Proxy, 4.4 Streaming, 4.5 PII, 4.6 Fehler/Fallback)
+- [~] Block 4 — Routing/Chat/PII ([~] 4.1 Phase A done, Phase B pending; [ ] 4.2/4.3/4.4/4.5/4.6)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
 - [ ] Block 5B — Chat-Features (5B.1 Datei-Upload, 5B.2 Datenanalyse+Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects)
 - [ ] Block 6 — Frontend (6.1 Chat, 6.2 Dashboard Logs, 6.3 Dashboard Verwaltung)
@@ -61,6 +61,45 @@ Drei Punkte, die ZWINGEND vor erstem echten User/Pilot stehen müssen:
    muss zumindest Magic-Link + Email-Bestätigung verifiziert sein.
 
 ## Letzte Session
+- 2026-05-31: Task 4.1 Phase A abgeschlossen. LiteLLM-Provider-Plumbing
+  + idempotenter models-Seed in decyra-api:
+  - Neue Migration `ebdf5bb9e9da_add_models_enabled.py`: schmale
+    `ALTER TABLE models ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT true`.
+    Brauchte das Flag, damit Google als deaktivierter Platzhalter in
+    der Tabelle leben kann ohne im Routing zu landen.
+  - `app/llm.py`: `configure_litellm()` pusht Provider-Keys aus
+    Settings in `os.environ`, damit `litellm.completion()` sie via
+    Standard-Lookup findet. Vertex/Google bewusst nicht konfiguriert.
+  - `app/seed_models.py`: 7 MODELS (6 aktiv + Google-Platzhalter)
+    als ModelSeed-Dataclasses. Idempotenter
+    `INSERT … ON CONFLICT (name) DO UPDATE`-SQL. Zwei Entrypoints:
+    `seed_with_connection(conn)` für die per-test Transaktion,
+    `seed_default()` für CLI (`python -m app.seed_models`).
+    `slots=True` initial drauf gehabt → `m.__dict__` failed →
+    Decorator auf nur `frozen=True` reduziert und auf explizite
+    benannte Dict-Params umgestellt (robust gegen Feld-Renamings).
+  - `scripts/test_providers.py` (neu, **nicht in pytest**): liest
+    enabled Modelle aus DB, ruft je einen "Hello"-Call via LiteLLM,
+    loggt OK/FAIL pro Modell. Erst nach User-Key-Eintrag laufen.
+  - `tests/test_seed_models.py`: 4 Struktur-Tests grün (Insert-Count,
+    Idempotenz, Mistral sovereign+eu_hosted, Google enabled=false).
+    Keine API-Calls in pytest.
+  - `.env.example`: Inline-Kommentar bei `GOOGLE_API_KEY`, dass Vertex
+    AI EU noch aussteht und der Seed-Eintrag enabled=false ist.
+  - Verifikation: Migration appliziert (`alembic upgrade head` →
+    ebdf5bb9e9da), `python -m app.seed_models` zweimal → 7 Zeilen,
+    keine Duplikate. psql zeigt Google enabled=f, Mistral eu_hosted=t
+    + sovereign_eligible=t. `pytest -v`: 28/28 grün (24 vorher + 4
+    neu).
+  - **Phase B steht aus**: User trägt `OPENAI_API_KEY`,
+    `ANTHROPIC_API_KEY`, `MISTRAL_API_KEY` in `.env` ein, läuft
+    `python scripts/test_providers.py`. Erwartung iterativ — erster
+    Lauf kann FAILs zeigen, wenn Model-IDs / Preise pro Account
+    abweichen (Mistral-Aliase, OpenAI-Versionierung, Anthropic-Datum-
+    Suffix). User korrigiert `MODELS` in `app/seed_models.py`, re-runt
+    `python -m app.seed_models` (ON CONFLICT-Update), läuft das
+    Test-Skript erneut. Idempotenter Seed ist genau dafür gebaut.
+
 - 2026-05-31: Task 3.2 abgeschlossen. Verify-Endpoints in decyra-api:
   - `app/audit.py`: neue Funktion `verify_workspace_chain(db,
     workspace_id)` liest Events aus DB in Chain-Order (timestamp ASC,
@@ -250,16 +289,19 @@ Drei Punkte, die ZWINGEND vor erstem echten User/Pilot stehen müssen:
     austauschbar via globals.css.
 
 ## Nächster Schritt
-Block 4 — Routing, Chat-Proxy & PII. Beginn mit Task 4.1 (LiteLLM &
-Provider-Anbindung):
-- LiteLLM-Config für OpenAI, Anthropic, Vertex AI EU, Mistral La
-  Plateforme.
-- `models`-Tabelle mit Seed-Migration füllen (alle 7 MVP-Modelle +
-  Preise).
-- "Hello World"-Smoke-Test pro Provider.
-- Async Audit-Write (war ursprünglich 3.2) hängt sich später in 4.3
-  (Chat-Proxy-Endpoint) ein, wo der erste echte Producer von
-  audit_events lebt.
+Zwei parallele Spuren:
+
+A) **Task 4.1 Phase B (User-Action, ohne Claude)** —
+   `.env` mit echten Provider-Keys füllen (OPENAI_API_KEY,
+   ANTHROPIC_API_KEY, MISTRAL_API_KEY), dann
+   `python scripts/test_providers.py` laufen. Erste FAILs sind
+   erwartet (Model-ID-Drift pro Account); korrigieren in
+   `app/seed_models.py::MODELS`, re-seeden, neu testen, bis
+   alle 6 aktiven Provider "OK" zurückgeben.
+
+B) **Task 4.2 (Test-Frontend, Claude)** — minimale Chat-Seite im
+   Frontend, ruft einen noch nicht existierenden Backend-Endpoint
+   (kommt in 4.3) auf. Frühe UI-Verifikation statt nur curl.
 
 Start in nächster Session:
-"Lies WORKPLAN.md und PROGRESS.md. Wir machen Task 4.1. Geh in Plan Mode."
+"Lies WORKPLAN.md und PROGRESS.md. Wir machen Task 4.2. Geh in Plan Mode."
