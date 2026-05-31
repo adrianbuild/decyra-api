@@ -3,13 +3,13 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 1 — Projekt-Setup**: Tasks 1.1, 1.2 und 1.3 abgeschlossen → als nächstes Task 2.1 (Supabase Auth).
+**Block 3 — Audit-Log mit Hash-Chain**: 3.1 abgeschlossen → als nächstes 3.2 (Verify & async).
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
-- [ ] Block 2 — Auth & Multi-Tenant (2.1 Auth, 2.2 Workspace, 2.3 Einladungen, 2.4 Isolation-Test)
-- [ ] Block 3 — Audit-Log (3.1 Hash-Chain, 3.2 Verify & async)
+- [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS, UI pausiert; [ ] 2.2/2.3/2.4)
+- [~] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [ ] 3.2 Verify & async)
 - [ ] Block 4 — Routing/Chat/PII (4.1 LiteLLM, 4.2 Test-Frontend, 4.3 Chat-Proxy, 4.4 Streaming, 4.5 PII, 4.6 Fehler/Fallback)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
 - [ ] Block 5B — Chat-Features (5B.1 Datei-Upload, 5B.2 Datenanalyse+Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects)
@@ -31,6 +31,42 @@
 - Bildgenerierung (5B.4): EU-Provider FLUX/Black Forest Labs — DPA und Souveränität vor Bau klären
 
 ## Letzte Session
+- 2026-05-31: Task 3.1 abgeschlossen. Hash-Chain-Mechanik in decyra-api:
+  - Neue Migration `36cbe1faa786_audit_hash_chain.py`: BEFORE INSERT
+    trigger `audit_events_hash_chain_insert` auf audit_events.
+    SECURITY DEFINER + fixed `search_path = pg_catalog, public`. Liest
+    letztes `current_hash` desselben workspace_id (ORDER BY
+    timestamp DESC, id DESC LIMIT 1), setzt NEW.prev_hash, berechnet
+    NEW.current_hash = `encode(sha256(canonical), 'hex')`.
+  - Im selben Migration-Step:
+    `ALTER TABLE audit_events ALTER COLUMN timestamp SET DEFAULT
+    clock_timestamp()`. `now()`/`transaction_timestamp()` liefert
+    Transaction-Start-Time → mehrere Events derselben Transaction
+    bekämen identische Timestamps und die ORDER-BY-Determinismus für
+    den Vorgänger-Lookup wäre kaputt. `clock_timestamp()` liefert
+    Wall-Clock pro Statement, pro Event eindeutig. Bug zuerst durch
+    drei-Inserts-im-Workspace-Test reproduziert, Diagnose isoliert
+    Python-Mirror als korrekt, Symptom auf Failure 1 zurückgeführt.
+  - Concurrency: `pg_advisory_xact_lock(hashtext('audit_chain:' ||
+    workspace_id))` serialisiert parallele Inserts pro Workspace,
+    transaction-scoped Auto-Release.
+  - Kanonisierung v1: `v1|<prev_or_empty>|<ws>|<user>|<iso8601_utc_us>|
+    n:model|n:request|n:response`, n = `octet_length()` = UTF-8-Bytes.
+    Mirror in `app/audit.py` (canonical_string, compute_hash).
+  - `app/audit.py`: AuditEventForHash dataclass, `verify_chain(events)`
+    akzeptiert Dataclass oder dict-rows, liefert
+    VerifyResult{valid, event_count, broken_at}. Genesis = prev_hash
+    NULL.
+  - `tests/test_hash_chain.py`: 4 Tests grün (first-genesis, chain-3
+    sequential, independent-workspaces, manipulation-pflichttest).
+    Pflicht-Test füttert verify_chain mit getampter Liste, erwartet
+    broken_at == 2.
+  - SHA-256 ist Postgres-builtin seit PG 11 (`sha256(bytea)` +
+    `encode(.., 'hex')`); kein pgcrypto.
+  - Append-only-Trigger aus 1.3 unverändert; alle 1.3-Tests grün.
+  - Migration läuft sauber gegen decyra (alembic upgrade head) und
+    decyra_test (conftest-rebuild). `pytest -v`: 17/17 grün.
+
 - 2026-05-30: Auth-Flow in UI ausgeblendet, Backend + Frontend-Routen
   bleiben aktiv, jederzeit reaktivierbar durch Wiedereinfügen des
   Links auf /. Magic-Link-zu-Email-Passwort-Umstellung verschoben.
@@ -140,20 +176,20 @@
     austauschbar via globals.css.
 
 ## Nächster Schritt
-Task 2.1 — Supabase Auth (decyra-api + decyra-web):
-- Supabase-Client im Backend und Frontend einrichten
-- Email-Registrierung mit Bestätigungs-Mail
-- Login (Magic Link bevorzugt)
-- Auth-Middleware Backend: JWT validieren, user_id extrahieren
-- Frontend: Session-Context, geschützte Routen, Logout
-- **Wichtig aus 1.3:** App-Tier muss als **non-superuser** Role gegen
-  Postgres laufen (sonst greift RLS nicht). In dev/test heißt die
-  Rolle `decyra_app` (vom conftest angelegt). Für die echte App-
-  Connection im Backend: separater Postgres-User mit `NOSUPERUSER
-  NOBYPASSRLS`, der vor jedem Request `SET LOCAL
-  app.current_workspace_id = '<uuid>'` setzt.
-- Audit-Hash-Berechnung (`prev_hash`/`current_hash`) kommt erst in 3.1
-  — die Spalten existieren bereits.
+Task 3.2 — Verify & async Audit-Write:
+- `verify_chain(workspace_id)` öffentlich als API-Endpoint (Backend-Dependency
+  injecten + Route mit Auth-Schutz). Logik existiert bereits in `app/audit.py`.
+- Audit-Write async (FastAPI BackgroundTask oder Redis-Queue) — Request
+  blockt nicht mehr auf den Hash-Trigger. Auswahl-Frage für Plan Mode:
+  BackgroundTask reicht im MVP, Queue wäre Overkill.
+- Test: intakte Kette verifiziert OK; manuell manipulierte Zeile wird
+  an korrekter Position erkannt (Integrationstest auf Endpoint statt
+  Library-Test wie in 3.1).
+- **Aus 3.1 mitnehmen:** App-Backend-Verbindung wechselt spätestens jetzt
+  auf `decyra_app` (NOSUPERUSER NOBYPASSRLS). Die SECURITY-DEFINER-
+  Funktion bleibt davon unberührt, weil sie als Owner=postgres läuft —
+  aber der Verify-Endpoint selbst muss als App-User SELECTen, damit
+  RLS greift.
 
 Start in nächster Session:
-"Lies WORKPLAN.md und PROGRESS.md. Wir machen Task 2.1. Geh in Plan Mode."
+"Lies WORKPLAN.md und PROGRESS.md. Wir machen Task 3.2. Geh in Plan Mode."
