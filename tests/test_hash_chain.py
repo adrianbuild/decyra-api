@@ -15,91 +15,23 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from app.audit import AuditEventForHash, compute_hash, verify_chain
-
-
-def _seed_workspace(db: Connection) -> tuple[str, str]:
-    org_id = db.execute(
-        text(
-            "INSERT INTO organizations (name) VALUES ('Acme') "
-            "RETURNING id"
-        )
-    ).scalar()
-    ws_id = str(db.execute(text("SELECT gen_random_uuid()")).scalar())
-    db.execute(text(f"SET LOCAL app.current_workspace_id = '{ws_id}'"))
-    db.execute(
-        text(
-            "INSERT INTO workspaces (id, organization_id, name) "
-            "VALUES (:i, :o, 'WS')"
-        ),
-        {"i": ws_id, "o": org_id},
-    )
-    user_id = str(
-        db.execute(
-            text(
-                "INSERT INTO users (email) VALUES ('a@b.de') "
-                "RETURNING id"
-            )
-        ).scalar()
-    )
-    return ws_id, user_id
-
-
-def _insert_event(
-    db: Connection,
-    ws_id: str,
-    user_id: str,
-    request: str,
-    response: str,
-    model: str = "gpt-5",
-):
-    return db.execute(
-        text(
-            "INSERT INTO audit_events "
-            "(workspace_id, user_id, model, request_text, "
-            "response_text, routed_to) "
-            "VALUES (:w, :u, :m, :req, :res, 'openai') "
-            "RETURNING id, timestamp, prev_hash, current_hash"
-        ),
-        {
-            "w": ws_id,
-            "u": user_id,
-            "m": model,
-            "req": request,
-            "res": response,
-        },
-    ).one()
-
-
-def _select_chain(db: Connection, ws_id: str):
-    return (
-        db.execute(
-            text(
-                "SELECT id, workspace_id, user_id, timestamp, model, "
-                "request_text, response_text, prev_hash, current_hash "
-                "FROM audit_events WHERE workspace_id = :w "
-                "ORDER BY timestamp ASC, id ASC"
-            ),
-            {"w": ws_id},
-        )
-        .mappings()
-        .all()
-    )
+from tests._helpers import insert_event, seed_workspace, select_chain
 
 
 def test_first_event_in_workspace_has_null_prev_hash(db: Connection) -> None:
-    ws_id, user_id = _seed_workspace(db)
-    row = _insert_event(db, ws_id, user_id, "first", "answer")
+    ws_id, user_id = seed_workspace(db)
+    row = insert_event(db, ws_id, user_id, "first", "answer")
     assert row.prev_hash is None
     assert row.current_hash is not None
     assert len(row.current_hash) == 64  # SHA-256 hex
 
 
 def test_subsequent_events_chain_correctly(db: Connection) -> None:
-    ws_id, user_id = _seed_workspace(db)
+    ws_id, user_id = seed_workspace(db)
     rows = []
     for i in range(3):
         rows.append(
-            _insert_event(db, ws_id, user_id, f"req{i}", f"res{i}")
+            insert_event(db, ws_id, user_id, f"req{i}", f"res{i}")
         )
         time.sleep(0.001)  # force distinct microseconds across rows
 
@@ -132,7 +64,7 @@ def test_subsequent_events_chain_correctly(db: Connection) -> None:
 def test_separate_workspaces_have_independent_chains(
     db: Connection,
 ) -> None:
-    ws_a, user_id = _seed_workspace(db)
+    ws_a, user_id = seed_workspace(db)
 
     # Second workspace sharing the same user.
     org_b = db.execute(
@@ -152,13 +84,13 @@ def test_separate_workspaces_have_independent_chains(
     )
 
     db.execute(text(f"SET LOCAL app.current_workspace_id = '{ws_a}'"))
-    a1 = _insert_event(db, ws_a, user_id, "a1", "ra1")
+    a1 = insert_event(db, ws_a, user_id, "a1", "ra1")
     db.execute(text(f"SET LOCAL app.current_workspace_id = '{ws_b}'"))
-    b1 = _insert_event(db, ws_b, user_id, "b1", "rb1")
+    b1 = insert_event(db, ws_b, user_id, "b1", "rb1")
     db.execute(text(f"SET LOCAL app.current_workspace_id = '{ws_a}'"))
-    a2 = _insert_event(db, ws_a, user_id, "a2", "ra2")
+    a2 = insert_event(db, ws_a, user_id, "a2", "ra2")
     db.execute(text(f"SET LOCAL app.current_workspace_id = '{ws_b}'"))
-    b2 = _insert_event(db, ws_b, user_id, "b2", "rb2")
+    b2 = insert_event(db, ws_b, user_id, "b2", "rb2")
 
     # Each chain has its own genesis.
     assert a1.prev_hash is None
@@ -174,11 +106,11 @@ def test_separate_workspaces_have_independent_chains(
 @pytest.mark.pflichttest
 def test_manipulation_breaks_chain(db: Connection) -> None:
     """PFLICHT-TEST: verify_chain catches a tampered event."""
-    ws_id, user_id = _seed_workspace(db)
+    ws_id, user_id = seed_workspace(db)
     for i in range(5):
-        _insert_event(db, ws_id, user_id, f"req{i}", f"res{i}")
+        insert_event(db, ws_id, user_id, f"req{i}", f"res{i}")
 
-    rows = _select_chain(db, ws_id)
+    rows = select_chain(db, ws_id)
     intact = [dict(r) for r in rows]
 
     # Sanity: untouched chain verifies cleanly.

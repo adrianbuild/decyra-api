@@ -40,6 +40,10 @@ TEST_DATABASE_URL = os.environ.get(
 )
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 os.environ.setdefault("SUPABASE_URL", "http://test-supabase.local")
+os.environ.setdefault(
+    "AUDIT_VERIFY_SECRET",
+    "test-verify-secret-padded-to-32-plus-bytes-x",
+)
 
 import jwt  # noqa: E402
 import pytest  # noqa: E402  (env override must happen first)
@@ -52,7 +56,7 @@ from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.engine import Connection, Engine  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
-from app.main import app  # noqa: E402
+from app.main import app, get_db  # noqa: E402
 
 TEST_ISSUER = f"{get_settings().supabase_url}/auth/v1"
 
@@ -104,9 +108,27 @@ def db(engine: Engine) -> Iterator[Connection]:
         connection.close()
 
 
+@pytest.fixture
+def app_with_db(db: Connection):
+    """FastAPI app with ``get_db`` overridden to the per-test Connection.
+
+    Endpoints under test see the same transaction the test seeded into,
+    so reads observe writes and the test-fixture rollback cleans both.
+    Auth tests that don't touch the DB are unaffected — the override
+    is set but unused.
+    """
+
+    def _override():
+        yield db
+
+    app.dependency_overrides[get_db] = _override
+    yield app
+    app.dependency_overrides.pop(get_db, None)
+
+
 @pytest_asyncio.fixture
-async def client() -> AsyncIterator[AsyncClient]:
-    transport = ASGITransport(app=app)
+async def client(app_with_db) -> AsyncIterator[AsyncClient]:
+    transport = ASGITransport(app=app_with_db)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
 
@@ -170,5 +192,33 @@ def make_token(test_ec_private_key):  # type: ignore[no-untyped-def]
             signing_key or test_ec_private_key,
             algorithm="ES256",
         )
+
+    return _make
+
+
+@pytest.fixture
+def make_verify_token():
+    """Mint a public verify token (HS256, AUDIT_VERIFY_SECRET)."""
+    from app.verify_token import ISSUER, issue_verify_token
+
+    def _make(
+        workspace_id: str,
+        ttl_seconds: int | None = None,
+        secret_override: str | None = None,
+    ) -> str:
+        if secret_override is None:
+            return issue_verify_token(
+                workspace_id, ttl_seconds=ttl_seconds
+            )
+        # Manually encode with a different secret for bad-sig tests.
+        now = int(time.time())
+        ttl = ttl_seconds if ttl_seconds is not None else 60
+        payload: dict[str, object] = {
+            "sub": workspace_id,
+            "iss": ISSUER,
+            "iat": now,
+            "exp": now + ttl,
+        }
+        return jwt.encode(payload, secret_override, algorithm="HS256")
 
     return _make

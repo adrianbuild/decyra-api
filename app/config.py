@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     supabase_jwt_audience: str = "authenticated"
     supabase_jwt_issuer: str | None = None  # defaults to f"{supabase_url}/auth/v1"
 
+    audit_verify_secret: str | None = None
+    audit_verify_token_default_ttl_seconds: int = 60 * 60 * 24 * 30  # 30d
+
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
     mistral_api_key: str | None = None

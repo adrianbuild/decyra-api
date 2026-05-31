@@ -3,13 +3,13 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 3 — Audit-Log mit Hash-Chain**: 3.1 abgeschlossen → als nächstes 3.2 (Verify & async).
+**Block 3 — Audit-Log mit Hash-Chain**: 3.2 abgeschlossen → als nächstes Block 4 (Routing/Chat/PII).
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
 - [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS, UI pausiert; [ ] 2.2/2.3/2.4)
-- [~] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [ ] 3.2 Verify & async)
+- [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
 - [ ] Block 4 — Routing/Chat/PII (4.1 LiteLLM, 4.2 Test-Frontend, 4.3 Chat-Proxy, 4.4 Streaming, 4.5 PII, 4.6 Fehler/Fallback)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
 - [ ] Block 5B — Chat-Features (5B.1 Datei-Upload, 5B.2 Datenanalyse+Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects)
@@ -30,7 +30,78 @@
 ## Offene Fragen / Blocker
 - Bildgenerierung (5B.4): EU-Provider FLUX/Black Forest Labs — DPA und Souveränität vor Bau klären
 
+## Security-Härtung vor Pilot (Task 2.2)
+Drei Punkte, die ZWINGEND vor erstem echten User/Pilot stehen müssen:
+
+1. **DB-Rolle decyra_app aktivieren.** App connectet aktuell als
+   `postgres` (SUPERUSER, BYPASSRLS). RLS-Policies aus 1.3 sind zur
+   Laufzeit wertlos. Strategie (A) — zwei URLs:
+   `MIGRATION_DATABASE_URL` (postgres) für Alembic,
+   `DATABASE_URL` (decyra_app) für die App. GRANTs in einer Migration
+   (USAGE auf schema public, pro Tabelle passend granular). Snapshot
+   2026-05-31: Rolle existiert (NOSUPERUSER+NOBYPASSRLS ✓), 0 Table-
+   GRANTs im dev-DB, FORCE RLS auf den 5 workspace-skopierten Tabellen
+   aktiv, Hash-Chain-Funktion SECURITY DEFINER + EXECUTE via PUBLIC.
+   conftest legt decyra_app+GRANTs nur im Test-DB an — Migration wird
+   Single Source of Truth.
+
+2. **Membership-Check auf internem Verify-Endpoint.** 3.2 prüft am
+   `GET /workspaces/{ws}/audit/verify` nur das JWT, nicht ob der User
+   tatsächlich Member des abgefragten Workspace ist. `workspace_members`
+   ist bis Task 2.2 leer. Sobald 2.2 die Memberships anlegt, im
+   Endpoint-Code (`app/main.py::verify_workspace_audit`) ein
+   `SELECT 1 FROM workspace_members WHERE user_id=:u AND
+   workspace_id=:w` ergänzen, 403 wenn fehlend. TODO-Marker im Code.
+
+3. **Login-UI reaktivieren + Email/Passwort + Email-Bestätigung.**
+   2.1-UI ist seit 2026-05-30 ausgeblendet (decyra-web
+   `src/app/page.tsx` static, Reaktivierung trivial via git history).
+   Magic-Link funktioniert, Email/Passwort-Fallback und
+   Email-Bestätigungsflow stehen noch aus. Vor erstem echten Login
+   muss zumindest Magic-Link + Email-Bestätigung verifiziert sein.
+
 ## Letzte Session
+- 2026-05-31: Task 3.2 abgeschlossen. Verify-Endpoints in decyra-api:
+  - `app/audit.py`: neue Funktion `verify_workspace_chain(db,
+    workspace_id)` liest Events aus DB in Chain-Order (timestamp ASC,
+    id ASC) und ruft die bestehende `verify_chain`. Keine Änderung
+    an verify_chain / canonical_string / compute_hash.
+  - `app/verify_token.py` (neu): `issue_verify_token` /
+    `decode_verify_token`. HS256-JWT mit eigenem
+    `AUDIT_VERIFY_SECRET` (getrennt vom Supabase-Secret), Claims
+    `sub=workspace_id, iss="decyra-audit", iat, exp`. Default-TTL 30d,
+    konfigurierbar via `AUDIT_VERIFY_TOKEN_DEFAULT_TTL_SECONDS`.
+    `decode_verify_token` validiert auch `UUID(sub)` → 401 statt 500
+    bei nicht-UUID sub.
+  - `app/main.py`:
+    `GET /workspaces/{workspace_id}/audit/verify` — JWT-geschützt via
+    bestehender `get_current_user`-Dependency. Membership-Check als
+    TODO (siehe Security-Härtung).
+    `GET /v/{token}` — public, kein Supabase-Auth. Token-only.
+    `get_db()` Dependency mit Module-Singleton-Engine
+    + per-request rollback (read-only Default).
+  - `tests/_helpers.py` (neu): `seed_workspace` / `insert_event` /
+    `select_chain` extrahiert aus test_hash_chain.py (DRY).
+  - `tests/conftest.py`: `AUDIT_VERIFY_SECRET` env override,
+    `make_verify_token`-Fixture (eigene Secret-Override-Variante für
+    Bad-Sig-Test), neuer `app_with_db`-Fixture mit
+    `dependency_overrides[get_db]`, `client` umgebaut auf
+    `app_with_db`.
+  - `tests/test_hash_chain.py`: Local-Helpers durch
+    `from tests._helpers import …` ersetzt, sonst unverändert.
+  - `tests/test_verify.py` (neu): 7 Tests grün — internal-requires-
+    auth, internal-intact, internal-tampered (PFLICHT, via
+    `SET session_replication_role = 'replica'` als SUPERUSER),
+    public-valid, public-expired, public-bad-sig, public-non-uuid-sub.
+  - `WORKPLAN.md`: 3.2 ergänzt um Note, dass async Audit-Write nach
+    4.3 (Chat-Proxy-Endpoint) wandert — der erste echte Producer.
+  - Vorheriger "OFFENER SICHERHEITSPUNKT"-Block in dedizierte Section
+    `## Security-Härtung vor Pilot (Task 2.2)` konsolidiert: drei
+    Punkte (decyra_app-Role, Membership-Check, Login-UI/Email).
+  - `pytest -v`: 24/24 grün (6 auth + 6 schema + 1 health + 4 hash-
+    chain + 7 verify). Die 6 Auth-Tests aus 2.1 nach client-Fixture-
+    Umbau alle namentlich grün — keine Regression.
+
 - 2026-05-31: Task 3.1 abgeschlossen. Hash-Chain-Mechanik in decyra-api:
   - Neue Migration `36cbe1faa786_audit_hash_chain.py`: BEFORE INSERT
     trigger `audit_events_hash_chain_insert` auf audit_events.
@@ -66,6 +137,9 @@
   - Append-only-Trigger aus 1.3 unverändert; alle 1.3-Tests grün.
   - Migration läuft sauber gegen decyra (alembic upgrade head) und
     decyra_test (conftest-rebuild). `pytest -v`: 17/17 grün.
+  - (Hinweis: der ursprünglich hier festgehaltene Sicherheitspunkt
+    zum decyra_app-Switch ist jetzt im Top-Block
+    "Security-Härtung vor Pilot (Task 2.2)" konsolidiert.)
 
 - 2026-05-30: Auth-Flow in UI ausgeblendet, Backend + Frontend-Routen
   bleiben aktiv, jederzeit reaktivierbar durch Wiedereinfügen des
@@ -176,20 +250,16 @@
     austauschbar via globals.css.
 
 ## Nächster Schritt
-Task 3.2 — Verify & async Audit-Write:
-- `verify_chain(workspace_id)` öffentlich als API-Endpoint (Backend-Dependency
-  injecten + Route mit Auth-Schutz). Logik existiert bereits in `app/audit.py`.
-- Audit-Write async (FastAPI BackgroundTask oder Redis-Queue) — Request
-  blockt nicht mehr auf den Hash-Trigger. Auswahl-Frage für Plan Mode:
-  BackgroundTask reicht im MVP, Queue wäre Overkill.
-- Test: intakte Kette verifiziert OK; manuell manipulierte Zeile wird
-  an korrekter Position erkannt (Integrationstest auf Endpoint statt
-  Library-Test wie in 3.1).
-- **Aus 3.1 mitnehmen:** App-Backend-Verbindung wechselt spätestens jetzt
-  auf `decyra_app` (NOSUPERUSER NOBYPASSRLS). Die SECURITY-DEFINER-
-  Funktion bleibt davon unberührt, weil sie als Owner=postgres läuft —
-  aber der Verify-Endpoint selbst muss als App-User SELECTen, damit
-  RLS greift.
+Block 4 — Routing, Chat-Proxy & PII. Beginn mit Task 4.1 (LiteLLM &
+Provider-Anbindung):
+- LiteLLM-Config für OpenAI, Anthropic, Vertex AI EU, Mistral La
+  Plateforme.
+- `models`-Tabelle mit Seed-Migration füllen (alle 7 MVP-Modelle +
+  Preise).
+- "Hello World"-Smoke-Test pro Provider.
+- Async Audit-Write (war ursprünglich 3.2) hängt sich später in 4.3
+  (Chat-Proxy-Endpoint) ein, wo der erste echte Producer von
+  audit_events lebt.
 
 Start in nächster Session:
-"Lies WORKPLAN.md und PROGRESS.md. Wir machen Task 3.2. Geh in Plan Mode."
+"Lies WORKPLAN.md und PROGRESS.md. Wir machen Task 4.1. Geh in Plan Mode."

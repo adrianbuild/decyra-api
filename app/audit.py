@@ -21,6 +21,9 @@ from datetime import datetime, timezone
 from typing import Iterable
 from uuid import UUID
 
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
+
 CANONICAL_VERSION = "v1"
 
 
@@ -125,3 +128,27 @@ def verify_chain(
     return VerifyResult(
         valid=True, event_count=len(events_list), broken_at=None
     )
+
+
+def verify_workspace_chain(
+    db: Connection, workspace_id: UUID | str
+) -> VerifyResult:
+    """Read all audit events for a workspace and run verify_chain.
+
+    Order is (timestamp ASC, id ASC), matching insertion order under
+    clock_timestamp() so genesis sits at index 0.
+    """
+    rows = (
+        db.execute(
+            text(
+                "SELECT id, workspace_id, user_id, timestamp, model, "
+                "request_text, response_text, prev_hash, current_hash "
+                "FROM audit_events WHERE workspace_id = :w "
+                "ORDER BY timestamp ASC, id ASC"
+            ),
+            {"w": str(workspace_id)},
+        )
+        .mappings()
+        .all()
+    )
+    return verify_chain([dict(r) for r in rows])

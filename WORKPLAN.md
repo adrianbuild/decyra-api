@@ -121,11 +121,12 @@
 - **DoD:** INSERT erzeugt korrekt verkettete Hashes; UPDATE/DELETE schlägt fehl
 
 ### Task 3.2 — Verify & async Write
-- [ ] verify_chain(workspace_id)-Funktion: liest Events, rechnet Kette nach, gibt OK/Fehlerposition
-- [ ] Audit-Write async (BullMQ/Redis-Queue oder FastAPI BackgroundTask)
-- [ ] Test: intakte Kette verifiziert OK
-- [ ] Test: manuell manipulierte Zeile wird an korrekter Position erkannt
-- **DoD:** beide Tests grün, Audit-Write blockiert nicht den Request
+- [x] verify_chain(workspace_id)-Funktion: liest Events, rechnet Kette nach, gibt OK/Fehlerposition
+- [ ] ~~Audit-Write async (BullMQ/Redis-Queue oder FastAPI BackgroundTask)~~ → **verschoben nach 4.3 (Chat-Proxy-Endpoint)**. Dort lebt der erste echte audit_events-Producer; Entscheidung BackgroundTask vs. Queue (Celery/Dramatiq/arq+Redis) fällt basierend auf der echten Pipeline.
+- [x] Test: intakte Kette verifiziert OK
+- [x] Test: manuell manipulierte Zeile wird an korrekter Position erkannt
+- [x] Bonus: Public Verify-Endpoint `GET /v/{token}` mit HS256-Token (eigenes `AUDIT_VERIFY_SECRET`, 30d-Default-TTL, UUID-sub-Guard)
+- **DoD:** beide Verify-Tests grün (intakt + manipuliert); async-Write zu 4.3 verschoben
 
 ---
 
