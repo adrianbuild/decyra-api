@@ -8,7 +8,7 @@
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
-- [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS, UI pausiert; [ ] 2.2/2.3/2.4)
+- [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [ ] 2.2b/2.2c/2.3/2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
 - [~] Block 4 — Routing/Chat/PII ([~] 4.1 Phase A done, Phase B pending; [ ] 4.2/4.3/4.4/4.5/4.6)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
@@ -53,14 +53,52 @@ Drei Punkte, die ZWINGEND vor erstem echten User/Pilot stehen müssen:
    `SELECT 1 FROM workspace_members WHERE user_id=:u AND
    workspace_id=:w` ergänzen, 403 wenn fehlend. TODO-Marker im Code.
 
-3. **Login-UI reaktivieren + Email/Passwort + Email-Bestätigung.**
-   2.1-UI ist seit 2026-05-30 ausgeblendet (decyra-web
-   `src/app/page.tsx` static, Reaktivierung trivial via git history).
-   Magic-Link funktioniert, Email/Passwort-Fallback und
-   Email-Bestätigungsflow stehen noch aus. Vor erstem echten Login
-   muss zumindest Magic-Link + Email-Bestätigung verifiziert sein.
+3. ~~**Login-UI reaktivieren + Email/Passwort.**~~ **Erledigt in 2.2a
+   (2026-06-01).** Korrektur einer früheren Fehlannahme: Es gab NIE
+   einen Login-Einstieg auf `src/app/page.tsx` und somit auch keinen
+   „Conditional-Block aus git history" zum Cherry-picken — `git log -p`
+   auf page.tsx zeigt nur das Entfernen der „Task 1.1"-Zeile, nie das
+   Hinzufügen/Entfernen eines Auth-Links. In 2.2a wurde der Login-
+   Einstieg FRISCH gebaut (Link `/` → `/login`) und `/login` von
+   Magic-Link auf Email/Passwort umgestellt. Offen bleibt nur der
+   bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-01: Task 2.2a abgeschlossen. Login-UI reaktiviert + auf
+  Email/Passwort umgestellt (decyra-web). Reine Frontend-Arbeit, KEINE
+  Backend-Änderung — `app/auth.py::get_current_user` validiert das
+  Supabase-ES256-JWT generisch (JWKS, aud/iss/sub/email), unabhängig
+  davon ob der User per Magic-Link oder Passwort eingeloggt ist. Per
+  Inspektion + test_auth.py bestätigt.
+  - `src/app/login/page.tsx`: Magic-Link (`signInWithOtp`) ersetzt durch
+    eine Seite mit Toggle Login/Registrieren, ein Formular (Email +
+    Passwort), zwei Submit-Pfade: `signInWithPassword` bzw. `signUp`.
+    Bei Erfolg `router.push("/dashboard")` + `refresh()`; @supabase/ssr
+    hat die httpOnly-Cookies da schon gesetzt. Supabase-Fehler (zu
+    kurzes Passwort, „User already registered", falsche Credentials)
+    landen sichtbar im UI (`role="alert"`). Guard: fehlt nach Erfolg
+    `data.session` (= Confirm-email wäre an), klare Meldung statt
+    stiller Redirect auf geschützte Route. KEINE eigene Passwort-Policy
+    (Supabase-seitige Ablehnung reicht für 2.2a).
+  - `src/app/page.tsx`: Login-Einstieg FRISCH gebaut — `next/link` →
+    `/login`. Bleibt Server-Component. (Kein cherry-pick: der alte
+    „Block aus git history" existierte nie, siehe Korrektur unten.)
+  - `/auth/callback`-PKCE-Route bewusst UNVERÄNDERT gelassen — bei
+    Passwort-Login ungenutzt, schadet nicht, hält Magic-Link als
+    spätere Option offen.
+  - Session bleibt server-side via httpOnly-Cookies (@supabase/ssr) —
+    bestehender Mechanismus, nichts Neues erfunden.
+  - Supabase-Dashboard (User-Action, erledigt): Authentication →
+    Email-Provider AN, „Confirm email" AUS. Ohne Bestätigung liefert
+    `signUp` sofort eine aktive Session → Dev-Flow ohne Inbox.
+  - Verifikation: `npm run build` grün (TS strict, 8 Routen). Backend
+    `pytest -q` 28/28 grün (kein Backend-Diff, reiner Regressions-
+    Check). Manueller Browser-Test (beide Pfade: neuer Account via
+    signUp + ausloggen/neu-einloggen via signInWithPassword, /me-Call,
+    Logout) durch den User.
+  - Scope-Abgrenzung: KEIN Workspace/Org (2.2b), kein decyra_app-Switch
+    (2.2c), kein Chat, kein Email-Bestätigungs-/Passwort-Reset-Flow.
+
 - 2026-05-31: Task 4.1 Phase A abgeschlossen. LiteLLM-Provider-Plumbing
   + idempotenter models-Seed in decyra-api:
   - Neue Migration `ebdf5bb9e9da_add_models_enabled.py`: schmale
@@ -181,11 +219,15 @@ Drei Punkte, die ZWINGEND vor erstem echten User/Pilot stehen müssen:
     "Security-Härtung vor Pilot (Task 2.2)" konsolidiert.)
 
 - 2026-05-30: Auth-Flow in UI ausgeblendet, Backend + Frontend-Routen
-  bleiben aktiv, jederzeit reaktivierbar durch Wiedereinfügen des
-  Links auf /. Magic-Link-zu-Email-Passwort-Umstellung verschoben.
+  bleiben aktiv. Magic-Link-zu-Email-Passwort-Umstellung verschoben
+  (→ in 2.2a erledigt).
   - Konkret entfernt: `decyra-web/src/app/page.tsx` zurück auf statische
     Server-Component (kein `async`, kein `getUser()`, keine Supabase-
-    Imports). Reaktivierung = Conditional-Block aus git-history holen.
+    Imports).
+  - **Korrektur (2026-06-01):** Die ursprüngliche Notiz „Reaktivierung =
+    Conditional-Block aus git-history holen" war falsch. `page.tsx`
+    hatte nie einen Auth-Link; der 2.1-Commit entfernte nur die
+    „Task 1.1"-Zeile. In 2.2a wurde der Login-Einstieg frisch gebaut.
   - Unverändert: /login, /auth/callback, /dashboard, Logout-Button,
     src/lib/supabase/*, src/middleware.ts, Backend komplett, alle
     Tests (13/13 grün).
