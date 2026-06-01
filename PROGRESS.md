@@ -8,7 +8,7 @@
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
-- [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [ ] 2.2b/2.2c/2.3/2.4)
+- [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [ ] 2.2c/2.3/2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
 - [~] Block 4 — Routing/Chat/PII ([~] 4.1 Phase A done, Phase B pending; [ ] 4.2/4.3/4.4/4.5/4.6)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
@@ -45,13 +45,14 @@ Drei Punkte, die ZWINGEND vor erstem echten User/Pilot stehen müssen:
    conftest legt decyra_app+GRANTs nur im Test-DB an — Migration wird
    Single Source of Truth.
 
-2. **Membership-Check auf internem Verify-Endpoint.** 3.2 prüft am
-   `GET /workspaces/{ws}/audit/verify` nur das JWT, nicht ob der User
-   tatsächlich Member des abgefragten Workspace ist. `workspace_members`
-   ist bis Task 2.2 leer. Sobald 2.2 die Memberships anlegt, im
-   Endpoint-Code (`app/main.py::verify_workspace_audit`) ein
+2. ~~**Membership-Check auf internem Verify-Endpoint.**~~ **Erledigt in
+   2.2b (2026-06-01).** `verify_workspace_audit` prüft jetzt
    `SELECT 1 FROM workspace_members WHERE user_id=:u AND
-   workspace_id=:w` ergänzen, 403 wenn fehlend. TODO-Marker im Code.
+   workspace_id=:w` → 403 wenn kein Member. TODO-Marker entfernt.
+   Negativ-Test `test_internal_verify_non_member_returns_403` beweist
+   den Check; die zwei internen Verify-Tests seeden jetzt eine
+   Membership (sonst 403). `workspace_members` wird durch
+   POST /onboarding gefüllt.
 
 3. ~~**Login-UI reaktivieren + Email/Passwort.**~~ **Erledigt in 2.2a
    (2026-06-01).** Korrektur einer früheren Fehlannahme: Es gab NIE
@@ -64,6 +65,50 @@ Drei Punkte, die ZWINGEND vor erstem echten User/Pilot stehen müssen:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-01: Task 2.2b abgeschlossen. Workspace/Org-Anlage beim ersten
+  Login (decyra-api + decyra-web). Live-Schema vorab gegen die laufende
+  DB per `\d` gegengeprüft — deckt sich mit der Migration.
+  - `app/onboarding.py` (neu): `ensure_workspace(db, user_id, email)` →
+    `OnboardingResult(workspace_id, workspace_name, created)`. Idempotent:
+    advisory xact lock `pg_advisory_xact_lock(hashtext('onboarding:'||
+    user_id))` (schützt den Idempotenz-Check vor Multi-Tab-Race), dann
+    Membership-Query; existiert ein Workspace → zurückgeben, kein Insert.
+    Sonst users→org→workspace→owner-membership in EINER Transaktion.
+    `users.id = Supabase-sub` explizit (Mirror, weil
+    `workspace_members.user_id` UND `audit_events.user_id` FK auf
+    `users.id` sind). Auto-Namen: org=`f"{local}s Organisation"`,
+    workspace=`"Standard-Workspace"`.
+  - `app/main.py`: neue `get_db_write`-Dependency mit `engine.begin()`
+    (Commit bei sauberem Exit, Rollback bei Exception) — getrennt vom
+    read-only `get_db` (das weiter zurückrollt). Commit gehört in die
+    Dependency, NICHT in den Endpoint (sonst zerschießt es die
+    Test-Transaktion). Beide teilen dasselbe Modul-`_engine`. Neuer
+    `POST /onboarding` (JWT, 400 wenn email-Claim fehlt). Membership-
+    Check in `verify_workspace_audit` (403 für Nicht-Member), TODO weg.
+  - `tests/conftest.py`: `app_with_db` überschreibt jetzt auch
+    `get_db_write` auf die per-Test-Connection (engine.begin() läuft im
+    Test nie; Fixture-Rollback hält Isolation).
+  - `tests/_helpers.py`: `add_member(db, ws_id, user_id, role="owner")`.
+  - `tests/test_verify.py`: zwei interne Tests
+    (`…_intact_chain_returns_valid`, `…_tampered_row_is_detected`) seeden
+    jetzt `add_member` (sonst 403 durch neuen Check); neuer
+    `test_internal_verify_non_member_returns_403`. Public-Tests
+    unverändert.
+  - `tests/test_onboarding.py` (neu): requires-auth (401),
+    creates-full-hierarchy (created=True, counts 1/1/1/1, role=owner,
+    user_id=sub, email gespiegelt), is-idempotent (2. Call created=False,
+    gleiche workspace_id, keine Duplikate).
+  - decyra-web `src/app/dashboard/page.tsx`: `POST /onboarding`
+    server-seitig vor dem `/me`-Call (gleicher Bearer-Token via
+    getSession). Best-effort try/catch — schlägt es fehl, rendert das
+    Dashboard trotzdem, nächster Load wiederholt. Workspace-Name/ID als
+    sichtbarer Beweis angezeigt.
+  - Verifikation: `pytest -q` 28→32 grün. `npm run build` grün (TS
+    strict, 8 Routen). RLS kein Insert-Blocker, weil App als postgres-
+    Superuser connectet (bestätigt; `SET LOCAL` erst mit 2.2c nötig).
+  - Scope-Abgrenzung: kein Namens-Formular, kein decyra_app-Switch
+    (2.2c), keine Multi-Workspace-/Einladungs-Logik, kein Chat.
+
 - 2026-06-01: Task 2.2a abgeschlossen. Login-UI reaktiviert + auf
   Email/Passwort umgestellt (decyra-web). Reine Frontend-Arbeit, KEINE
   Backend-Änderung — `app/auth.py::get_current_user` validiert das

@@ -90,10 +90,26 @@
 - **DoD:** User kann sich registrieren, einloggen, ausloggen; geschützte Route blockt ohne Login
 
 ### Task 2.2 — Workspace & Onboarding
-- [ ] Beim ersten Login: Organization + Workspace automatisch anlegen, User wird Owner
-- [ ] Endpoint: aktuellen Workspace + Rolle des Users zurückgeben
-- [ ] Frontend: Workspace-Kontext global verfügbar
-- **DoD:** neuer User landet in eigenem Workspace als Owner
+> In Unter-Tasks gegliedert: 2.2a (Login-UI), 2.2b (Onboarding),
+> 2.2c (decyra_app-Rollen-Switch, vor Pilot).
+
+#### Task 2.2a — Login-UI + Email/Passwort ✅ (2026-06-01)
+- [x] Login-UI reaktiviert, Magic-Link → Email/Passwort (signUp/signInWithPassword)
+- [x] Session via @supabase/ssr (httpOnly-Cookies), Logout, /me-Beweis
+
+#### Task 2.2b — Workspace/Org-Anlage ✅ (2026-06-01)
+- [x] POST /onboarding (JWT, idempotent via advisory lock + Membership-Query)
+- [x] Erst-Call: users(id=sub)+org+workspace+owner-membership in einer Transaktion
+- [x] Zweit-Call: kein Duplikat, bestehenden Workspace zurückgeben
+- [x] Membership-Check auf internem Verify-Endpoint (403 Nicht-Member) nachgezogen
+- [x] Frontend ruft /onboarding beim Dashboard-Load (best-effort)
+- **DoD:** neuer User landet in eigenem Workspace als Owner ✅ (32 Tests grün)
+
+#### Task 2.2c — decyra_app-Rollen-Switch (offen, vor Pilot)
+- [ ] App auf decyra_app (NOSUPERUSER/NOBYPASSRLS) umstellen, RLS aktiv
+- [ ] MIGRATION_DATABASE_URL (postgres) vs DATABASE_URL (decyra_app)
+- [ ] GRANTs in Migration; SET LOCAL ROLE + app.current_workspace_id pro Request
+- **DoD:** RLS feuert zur Laufzeit, Cross-Tenant-Insert/-Read unmöglich
 
 ### Task 2.3 — Einladungen & Rollen
 - [ ] Einladungs-Token-Tabelle (token, workspace_id, email, role, expires_at)

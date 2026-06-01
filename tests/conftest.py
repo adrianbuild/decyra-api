@@ -56,7 +56,7 @@ from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.engine import Connection, Engine  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
-from app.main import app, get_db  # noqa: E402
+from app.main import app, get_db, get_db_write  # noqa: E402
 
 TEST_ISSUER = f"{get_settings().supabase_url}/auth/v1"
 
@@ -121,9 +121,15 @@ def app_with_db(db: Connection):
     def _override():
         yield db
 
+    # Both read (get_db) and write (get_db_write) endpoints share the
+    # per-test Connection. The write dependency's real engine.begin()
+    # never runs under test; the db fixture's transaction rolls back,
+    # so onboarding writes stay isolated.
     app.dependency_overrides[get_db] = _override
+    app.dependency_overrides[get_db_write] = _override
     yield app
     app.dependency_overrides.pop(get_db, None)
+    app.dependency_overrides.pop(get_db_write, None)
 
 
 @pytest_asyncio.fixture

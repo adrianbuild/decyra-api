@@ -38,6 +38,20 @@ def seed_workspace(db: Connection) -> tuple[str, str]:
     return ws_id, user_id
 
 
+def add_member(
+    db: Connection, ws_id: str, user_id: str, role: str = "owner"
+) -> None:
+    """Add a workspace membership. Assumes the users row already exists
+    (e.g. created by ``seed_workspace``)."""
+    db.execute(
+        text(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) "
+            "VALUES (:w, :u, :r)"
+        ),
+        {"w": ws_id, "u": user_id, "r": role},
+    )
+
+
 def insert_event(
     db: Connection,
     ws_id: str,

@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from tests._helpers import insert_event, seed_workspace
+from tests._helpers import add_member, insert_event, seed_workspace
 
 
 # -- internal endpoint ---------------------------------------------------
@@ -24,6 +24,7 @@ async def test_internal_verify_intact_chain_returns_valid(
     client, db: Connection, make_token
 ) -> None:
     ws_id, user_id = seed_workspace(db)
+    add_member(db, ws_id, user_id)
     for i in range(3):
         insert_event(db, ws_id, user_id, f"req{i}", f"res{i}")
     token = make_token(sub=user_id)
@@ -45,6 +46,7 @@ async def test_internal_verify_tampered_row_is_detected(
 ) -> None:
     """PFLICHT-TEST (3.2): endpoint reports valid=False with broken_at."""
     ws_id, user_id = seed_workspace(db)
+    add_member(db, ws_id, user_id)
     rows = [
         insert_event(db, ws_id, user_id, f"req{i}", f"res{i}")
         for i in range(5)
@@ -71,6 +73,21 @@ async def test_internal_verify_tampered_row_is_detected(
     body = r.json()
     assert body["valid"] is False
     assert body["broken_at"] == 2
+
+
+@pytest.mark.asyncio
+async def test_internal_verify_non_member_returns_403(
+    client, db: Connection, make_token
+) -> None:
+    """A valid JWT for a user who is NOT a member of the workspace is
+    rejected with 403, even though the token itself is valid."""
+    ws_id, _ = seed_workspace(db)  # no membership for the token's sub
+    token = make_token(sub="99999999-9999-9999-9999-999999999999")
+    r = await client.get(
+        f"/workspaces/{ws_id}/audit/verify",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 403
 
 
 # -- public token endpoint -----------------------------------------------
