@@ -68,6 +68,21 @@ def get_db_write(
         yield conn
 
 
+def set_workspace_context(db: Connection, workspace_id: object) -> None:
+    """Set the transaction-local RLS context for workspace-scoped queries.
+
+    Uses set_config(..., is_local=true) with a BOUND parameter — never an
+    f-string, or the workspace_id would be a SQL-injection vector. The
+    is_local=true makes it transaction-scoped, so no bleed across pooled
+    connections. Under decyra_app this is what scopes RLS; with the GUC
+    unset, the policies match nothing (secure default).
+    """
+    db.execute(
+        text("SELECT set_config('app.current_workspace_id', :ws, true)"),
+        {"ws": str(workspace_id)},
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -116,6 +131,7 @@ def verify_workspace_audit(
     workspace being verified, else 403. workspace_members is populated
     by POST /onboarding (Task 2.2b).
     """
+    set_workspace_context(db, workspace_id)
     member = db.execute(
         text(
             "SELECT 1 FROM workspace_members "
@@ -143,6 +159,7 @@ def public_verify(
 ) -> dict[str, object]:
     """Public verify endpoint — token-only, no Supabase auth."""
     workspace_id = decode_verify_token(token)
+    set_workspace_context(db, workspace_id)
     result = verify_workspace_chain(db, workspace_id)
     return {
         "workspace_id": workspace_id,

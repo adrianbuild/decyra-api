@@ -39,6 +39,12 @@ TEST_DATABASE_URL = os.environ.get(
     "postgresql://postgres:postgres@localhost:55432/decyra_test",
 )
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+# Pin the migration URL to the TEST db too. Otherwise pydantic reads
+# MIGRATION_DATABASE_URL from .env (the DEV db) and alembic upgrade would
+# run against dev while the engine fixture drops/recreates decyra_test —
+# leaving the test schema empty. Tests connect as postgres anyway, so the
+# migration role == the test DATABASE_URL role.
+os.environ["MIGRATION_DATABASE_URL"] = TEST_DATABASE_URL
 os.environ.setdefault("SUPABASE_URL", "http://test-supabase.local")
 os.environ.setdefault(
     "AUDIT_VERIFY_SECRET",
@@ -78,20 +84,11 @@ def engine() -> Iterator[Engine]:
     alembic_cfg = AlembicConfig("alembic.ini")
     command.upgrade(alembic_cfg, "head")
 
-    with eng.begin() as conn:
-        conn.execute(text("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'decyra_app') THEN
-                    CREATE ROLE decyra_app NOLOGIN NOSUPERUSER NOBYPASSRLS;
-                END IF;
-            END
-            $$;
-        """))
-        conn.execute(text("GRANT USAGE ON SCHEMA public TO decyra_app"))
-        conn.execute(
-            text("GRANT ALL ON ALL TABLES IN SCHEMA public TO decyra_app")
-        )
+    # NOTE: the decyra_app role AND its grants now come from the 2.2c
+    # migration (single source of truth). conftest deliberately does NOT
+    # grant anything extra — a blanket GRANT ALL here would give decyra_app
+    # UPDATE on audit_events and make the append-only-grant test worthless.
+    # Tests reach decyra_app via SET LOCAL ROLE on the postgres session.
 
     yield eng
     eng.dispose()
@@ -135,6 +132,40 @@ def app_with_db(db: Connection):
 @pytest_asyncio.fixture
 async def client(app_with_db) -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app_with_db)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+@pytest.fixture
+def app_with_db_decyra_app(db: Connection):
+    """Like app_with_db, but the per-request connection drops to decyra_app
+    (SET LOCAL ROLE) so endpoint code runs under sharp RLS — proving the
+    full request path (endpoint -> get_db -> set_config -> RLS), not just
+    the data layer. Asserts authenticity so a silent superuser fallthrough
+    fails loud."""
+
+    def _override():
+        db.execute(text("SET LOCAL ROLE decyra_app"))
+        who = db.execute(
+            text("SELECT current_user, current_setting('is_superuser')")
+        ).one()
+        assert who[0] == "decyra_app" and who[1] == "off", (
+            f"expected unprivileged decyra_app, got {who}"
+        )
+        yield db
+
+    app.dependency_overrides[get_db] = _override
+    app.dependency_overrides[get_db_write] = _override
+    yield app
+    app.dependency_overrides.pop(get_db, None)
+    app.dependency_overrides.pop(get_db_write, None)
+
+
+@pytest_asyncio.fixture
+async def client_decyra_app(
+    app_with_db_decyra_app,
+) -> AsyncIterator[AsyncClient]:
+    transport = ASGITransport(app=app_with_db_decyra_app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
 

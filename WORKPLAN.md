@@ -105,11 +105,12 @@
 - [x] Frontend ruft /onboarding beim Dashboard-Load (best-effort)
 - **DoD:** neuer User landet in eigenem Workspace als Owner ✅ (32 Tests grün)
 
-#### Task 2.2c — decyra_app-Rollen-Switch (offen, vor Pilot)
-- [ ] App auf decyra_app (NOSUPERUSER/NOBYPASSRLS) umstellen, RLS aktiv
-- [ ] MIGRATION_DATABASE_URL (postgres) vs DATABASE_URL (decyra_app)
-- [ ] GRANTs in Migration; SET LOCAL ROLE + app.current_workspace_id pro Request
-- **DoD:** RLS feuert zur Laufzeit, Cross-Tenant-Insert/-Read unmöglich
+#### Task 2.2c — decyra_app-Rollen-Switch ✅ (2026-06-02)
+- [x] App auf decyra_app (NOSUPERUSER/NOBYPASSRLS) umgestellt, RLS aktiv
+- [x] MIGRATION_DATABASE_URL (postgres) vs DATABASE_URL (decyra_app)
+- [x] GRANTs + onboard_user (SECURITY DEFINER) in Migration; per-Request set_config
+- [x] RLS-Beweis-Test (decyra_app, B unsichtbar, is_superuser=off) + Live-Smoke
+- **DoD:** RLS feuert zur Laufzeit, Cross-Tenant-Insert/-Read unmöglich ✅ (35 Tests grün)
 
 ### Task 2.3 — Einladungen & Rollen
 - [ ] Einladungs-Token-Tabelle (token, workspace_id, email, role, expires_at)

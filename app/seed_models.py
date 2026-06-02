@@ -140,8 +140,14 @@ def seed_with_connection(conn: Connection) -> int:
 
 
 def seed_default() -> int:
-    """Open the configured DATABASE_URL, run the upsert, commit. CLI use."""
-    engine = create_engine(get_settings().database_url, future=True)
+    """Open the privileged URL, run the upsert, commit. CLI use.
+
+    Uses MIGRATION_DATABASE_URL (postgres) — decyra_app only has SELECT on
+    models and would fail the upsert loud, by design.
+    """
+    settings = get_settings()
+    url = settings.migration_database_url or settings.database_url
+    engine = create_engine(url, future=True)
     with engine.begin() as conn:
         return seed_with_connection(conn)
 

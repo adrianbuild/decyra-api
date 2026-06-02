@@ -9,10 +9,14 @@ from app.config import get_settings
 
 config = context.config
 
-# DATABASE_URL is sourced from pydantic-settings so dev (decyra) and test
-# (decyra_test) routes through the same .env / DATABASE_URL override path
-# as the rest of the app — no hardcoded URLs in alembic.ini.
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# Migrations need DDL + GRANT privileges, which decyra_app lacks. Use
+# MIGRATION_DATABASE_URL (postgres) when set; fall back to database_url
+# for back-compat (and tests, which connect as postgres anyway).
+_settings = get_settings()
+config.set_main_option(
+    "sqlalchemy.url",
+    _settings.migration_database_url or _settings.database_url,
+)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

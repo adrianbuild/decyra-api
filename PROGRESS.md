@@ -8,7 +8,7 @@
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
-- [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [ ] 2.2c/2.3/2.4)
+- [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [x] 2.2c decyra_app-Switch + RLS scharf; [ ] 2.3/2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
 - [~] Block 4 — Routing/Chat/PII ([~] 4.1 Phase A done, Phase B pending; [ ] 4.2/4.3/4.4/4.5/4.6)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
@@ -33,17 +33,16 @@
 ## Security-Härtung vor Pilot (Task 2.2)
 Drei Punkte, die ZWINGEND vor erstem echten User/Pilot stehen müssen:
 
-1. **DB-Rolle decyra_app aktivieren.** App connectet aktuell als
-   `postgres` (SUPERUSER, BYPASSRLS). RLS-Policies aus 1.3 sind zur
-   Laufzeit wertlos. Strategie (A) — zwei URLs:
-   `MIGRATION_DATABASE_URL` (postgres) für Alembic,
-   `DATABASE_URL` (decyra_app) für die App. GRANTs in einer Migration
-   (USAGE auf schema public, pro Tabelle passend granular). Snapshot
-   2026-05-31: Rolle existiert (NOSUPERUSER+NOBYPASSRLS ✓), 0 Table-
-   GRANTs im dev-DB, FORCE RLS auf den 5 workspace-skopierten Tabellen
-   aktiv, Hash-Chain-Funktion SECURITY DEFINER + EXECUTE via PUBLIC.
-   conftest legt decyra_app+GRANTs nur im Test-DB an — Migration wird
-   Single Source of Truth.
+1. ~~**DB-Rolle decyra_app aktivieren.**~~ **Erledigt in 2.2c
+   (2026-06-02).** App connectet jetzt als `decyra_app` (NOSUPERUSER,
+   NOBYPASSRLS) via `DATABASE_URL`; Alembic + Seed via
+   `MIGRATION_DATABASE_URL` (postgres). GRANTs + Rollen-Attribute +
+   `onboard_user()` in Migration `d3f7a1c95b2e` (Single Source of
+   Truth — conftest grantet NICHTS mehr). RLS feuert zur Laufzeit,
+   live belegt: `pg_stat_activity` zeigt die laufende App als
+   `decyra_app`, und `test_rls_blocks_cross_workspace_as_decyra_app`
+   beweist Cross-Workspace-Isolation (B unsichtbar) mit
+   Authentizitäts-Assertion (`is_superuser='off'`).
 
 2. ~~**Membership-Check auf internem Verify-Endpoint.**~~ **Erledigt in
    2.2b (2026-06-01).** `verify_workspace_audit` prüft jetzt
@@ -65,6 +64,57 @@ Drei Punkte, die ZWINGEND vor erstem echten User/Pilot stehen müssen:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-02: Task 2.2c abgeschlossen. decyra_app-Rollen-Switch, RLS
+  scharf geschaltet. Live gegen die laufende Dev-DB inspiziert (rolcanlogin
+  war f → LOGIN fehlte; in Migration gefixt).
+  - Migration `d3f7a1c95b2e`: Rolle härten (`ALTER ROLE decyra_app LOGIN
+    NOSUPERUSER NOBYPASSRLS`, idempotenter DO-Block), `GRANT USAGE ON
+    SCHEMA public`, per-Tabelle-GRANTs (audit_events nur SELECT+INSERT =
+    append-only auf Rollen-Ebene; models nur SELECT; ws-skopierte
+    SELECT/INSERT/UPDATE/DELETE; orgs/users SELECT/INSERT/UPDATE).
+    KEINE Blankett-DEFAULT-PRIVILEGES (loud failing für künftige
+    Tabellen — bewusste Entscheidung). `onboard_user(uuid,text)` als
+    `SECURITY DEFINER SET search_path=pg_catalog,public` (Henne-Ei:
+    user-Achsen-Idempotenz-Check inkompatibel mit ws-skopierter RLS →
+    Funktion läuft als Owner, bypasst RLS für genau diese Logik;
+    REVOKE PUBLIC + GRANT EXECUTE an decyra_app).
+  - `app/onboarding.py`: `ensure_workspace` ist jetzt dünner Wrapper um
+    `SELECT … FROM onboard_user(:u,:e)`.
+  - `app/main.py`: `set_workspace_context` setzt
+    `set_config('app.current_workspace_id', :ws, true)` mit Bind-Param
+    (NIE f-String → keine Injection); verify + public_verify setzen den
+    Kontext vor den Reads. get_db/get_db_write teilen weiter ein `_engine`.
+  - `app/config.py`: `migration_database_url`. `alembic/env.py` +
+    `seed_models.seed_default`: bevorzugen Migration-URL (Fallback
+    database_url).
+  - `tests/conftest.py`: GRANT-Block ENTFERNT (Migration ist Single
+    Source of Truth; ein GRANT ALL hätte den append-only-Grant-Test
+    wertlos gemacht). **`MIGRATION_DATABASE_URL` auf Test-DB gepinnt** —
+    sonst leakt die .env-Dev-URL in die Tests und alembic upgrade liefe
+    gegen die Dev-DB während decyra_test leer gedroppt bleibt (genau
+    dieser Bug trat auf, diagnostiziert + gefixt). Neue Fixtures
+    `app_with_db_decyra_app`/`client_decyra_app` (Override macht
+    `SET LOCAL ROLE decyra_app` + Authentizitäts-Assertion).
+  - `tests/test_rls.py` (neu, 3 Tests, alle als decyra_app):
+    cross-workspace-isolation (B unsichtbar + WITH-CHECK-Block,
+    Daten-Schicht), audit_events-append-only-grant (UPDATE → permission
+    denied), endpoint-isolation (onboard→verify own 200 / foreign 403,
+    voller Request-Pfad via client_decyra_app). Jeder asserted
+    `current_user='decyra_app'` + `is_superuser='off'`.
+  - Manipulations-Test (`test_internal_verify_tampered_row_is_detected`)
+    bleibt BEWUSST postgres (modelliert privilegierten Angreifer;
+    `session_replication_role` braucht Superuser; decyra_app kann gar
+    nicht tampern). Dokumentiert, kein Trigger-Umbau.
+  - `.env.example` + reale `.env`: DATABASE_URL=decyra_app,
+    MIGRATION_DATABASE_URL=postgres. `docker/init-test-db.sql`: Dev-
+    Wegwerf-Passwort `decyra_app_dev` (LOCAL ONLY, klar kommentiert).
+  - Verifikation: `pytest -q` **35 grün** (32→35). Live-Smoke:
+    App-URL connectet als decyra_app/is_superuser=off; uvicorn gestartet,
+    `GET /v/{token}` → 200; `pg_stat_activity` zeigt die laufende App als
+    `usename=decyra_app`. Dev-DB-Migration appliziert, decyra_app-Passwort
+    gesetzt.
+  - Scope: kein voller Multi-Tenant-Block (2.4), keine Einladungen (2.3).
+
 - 2026-06-01: Task 2.2b abgeschlossen. Workspace/Org-Anlage beim ersten
   Login (decyra-api + decyra-web). Live-Schema vorab gegen die laufende
   DB per `\d` gegengeprüft — deckt sich mit der Migration.

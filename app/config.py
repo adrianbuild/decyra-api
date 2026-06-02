@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     )
 
     database_url: str
+    # Privileged URL (postgres) for Alembic + model seed. The app runtime
+    # uses database_url (decyra_app). Falls back to database_url if unset.
+    migration_database_url: str | None = None
 
     supabase_url: str | None = None
     supabase_jwt_audience: str = "authenticated"
