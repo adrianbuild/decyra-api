@@ -166,13 +166,15 @@
 - **DoD:** du kannst im Browser eine Anfrage abschicken statt nur mit curl zu testen
 - *Begründung: spart ab jetzt bei jedem weiteren Task Test-Zeit*
 
-### Task 4.3 — Chat-Proxy-Endpoint
-- [ ] POST /v1/chat/completions (OpenAI-kompatibles Schema)
-- [ ] Routing: model-Param → richtiger Provider via LiteLLM
-- [ ] Workspace-Policy-Check: darf User dieses Modell im aktuellen Tier?
-- [ ] Cost-Tracking: tatsächliche Input/Output-Tokens + Kosten loggen
-- [ ] Audit-Event nach jedem Call schreiben (async, aus Block 3)
-- **DoD:** Chat-Request läuft, wird geloggt, Kosten erfasst
+### Task 4.3 — Chat-Proxy-Endpoint ✅ (2026-06-04)
+- [x] POST /v1/chat/completions (OpenAI-kompatibel, non-streaming) + persistente Konversationen (conversations/messages, RLS Workspace + privat-Filter)
+- [x] Routing: model-Param → Provider via LiteLLM (configure_litellm im lifespan)
+- [x] Policy-Check: Modell existiert + enabled (echter Tier-Check später, Tier-Feld fehlt)
+- [x] Cost-Tracking: echte Tokens aus litellm.usage × Preis aus models
+- [x] Audit-Event pro Call SYNCHRON in die Hash-Chain (LLM vor der Transaktion) — erster echter audit_events-Producer
+- [x] Multi-Turn (conversation_id), Konversations-Endpoints (Liste/laden, privat)
+- **DoD:** Chat-Request läuft, wird geloggt + auditiert + verifizierbar, Kosten erfasst ✅ (60 Tests grün, LLM gestubbt)
+- Hinweis: echte LLM-Antworten = 4.1 Phase B (Keys), Frontend = 4.2.
 
 ### Task 4.4 — Streaming (eigener Task — kniffliger Teil)
 - [ ] Server-Sent-Events / Streaming-Response vom Provider durchreichen

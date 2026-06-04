@@ -10,7 +10,7 @@
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
 - [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [x] 2.2c decyra_app-Switch + RLS scharf; [x] 2.3 Einladungen & Rollen; [ ] 2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
-- [~] Block 4 — Routing/Chat/PII ([~] 4.1 Phase A done, Phase B pending; [ ] 4.2/4.3/4.4/4.5/4.6)
+- [~] Block 4 — Routing/Chat/PII ([~] 4.1 Phase A done, Phase B pending; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [ ] 4.2/4.4/4.5/4.6)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
 - [ ] Block 5B — Chat-Features (5B.1 Datei-Upload, 5B.2 Datenanalyse+Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects)
 - [ ] Block 6 — Frontend (6.1 Chat, 6.2 Dashboard Logs, 6.3 Dashboard Verwaltung)
@@ -75,6 +75,55 @@ Die drei ursprünglichen Punkte:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-04: Task 4.3 abgeschlossen. Chat-Proxy mit persistenten
+  Konversationen — der ERSTE echte audit_events-Producer (Block 3 ⨯
+  Block 4). Migration `c5d9e1f0a2b3` (down_revision b8e4f2a16c9d).
+  - `conversations` (workspace_id FK, user_id FK, title, visibility
+    DEFAULT 'private' CHECK('private'), created/updated_at) +
+    `messages` (conversation_id FK CASCADE, workspace_id FK denorm.,
+    role CHECK, content, model, prompt/completion_tokens, cost,
+    created_at DEFAULT **clock_timestamp()** — sonst gleiche
+    Turn-Timestamps → kaputte Reihenfolge, wie audit_events in 3.1).
+    RLS = Workspace (FORCE) auf beiden; „privat" = expliziter
+    user_id-Query-Filter (KEINE RLS-Härte → Privatsphäre-Test ist
+    Wächter). GRANT conversations SELECT/INSERT/UPDATE, messages
+    SELECT/INSERT (KEIN DELETE — kein Lösch-Feature in 4.3).
+  - `app/chat.py`: compute_cost (Tokens/1M × Preis), derive_title
+    (robust: erste user-Zeile, 60 Zeichen, Fallback), audit_request_text
+    (alle NEUEN user-Msgs konkateniert, ohne Historie — keine
+    forensische Lücke), build_openai_response, DB-Helper. messages.
+    workspace_id IMMER aus der Konversation abgeleitet (nie aus Request).
+  - `app/main.py`: POST /v1/chat/completions (OpenAI-kompatibel, non-
+    streaming). Zwei Dependencies: db_read (Historie/Ownership) +
+    db_write (Persist) — LLM-Call dazwischen, db_write idle (advisory
+    lock erst am Audit-INSERT). conversation_id-Semantik: ohne →
+    stateless, trotzdem Konv. angelegt+auditiert; mit → Historie laden
+    + anhängen; beides → conversation_id gewinnt. **Compliance: KEIN
+    Pfad ohne Persist+Audit.** stream:true → 400; Modell nicht
+    enabled/unbekannt → 400; fremde/keine Konv. → 404; kein Member →
+    403. GET /conversations + /conversations/{id} (privat, user_id-
+    Filter, fremd → 404). lifespan ruft configure_litellm().
+  - `tests/conftest.py`: autouse `stub_llm` (monkeypatcht
+    litellm.completion → kein echter Call; .state/.calls zum Tunen/
+    Prüfen).
+  - `tests/test_chat.py` (11 Tests): OpenAI-Format, Persistenz, Multi-
+    Turn (Stub sieht Historie+neu), Audit+Chain-verify (event_count
+    wächst, valid), Cost (20.0 bei 1M/0.5M × 5/30), unknown/disabled
+    Modell 400, stream 400, no-membership 403, get-with-messages,
+    list-only-own, und PROMINENT die Privatsphäre als decyra_app
+    (is_superuser='off'): User B sieht A's Konv. nicht (404 + leere
+    Liste).
+  - DEBUG (Diagnose vor Fix): 1 roter Test war ein TEST-Bug
+    (`_seed_model` in test_list vergessen → 400 model not available →
+    nichts angelegt), kein App-Bug — instrumentiert (POST-Status +
+    Direkt-Count), Ursache gesehen, Model-Seed ergänzt.
+  - Verifikation: `pytest -q` **60 grün** (49→60). Migration auf Dev
+    appliziert, Grants verifiziert. Echte LLM-Calls bleiben 4.1 Phase B
+    (User-Action mit Keys), in pytest gestubbt.
+  - Scope: kein Streaming (4.4), kein Teilen (visibility immer private),
+    kein PII (4.5), kein Router/Fallback (4.6), kein Tier-Check, kein
+    Frontend (4.2).
+
 - 2026-06-04: Task 2.3 abgeschlossen. Einladungen & Rollen — mehrere
   Mitarbeiter in einer Org. Migration `b8e4f2a16c9d` (down_revision
   d3f7a1c95b2e).

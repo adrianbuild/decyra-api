@@ -1,20 +1,32 @@
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from uuid import UUID
 
+import litellm
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
-from app import invitations, mail
+from app import chat, invitations, mail
 from app.audit import verify_workspace_chain
 from app.auth import AuthenticatedUser, get_current_user
 from app.config import Settings, get_settings
+from app.llm import configure_litellm
 from app.onboarding import ensure_workspace
 from app.verify_token import decode_verify_token
 
-app = FastAPI(title="Decyra API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Push provider keys from Settings into os.environ so litellm finds
+    # them. Without this litellm has no credentials.
+    configure_litellm()
+    yield
+
+
+app = FastAPI(title="Decyra API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -198,6 +210,213 @@ def revoke_invitation(
     if not invitations.revoke_invitation(db, token, member.organization_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="invitation not found")
     return {"revoked": True}
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: list[ChatMessage]
+    temperature: float | None = None
+    max_tokens: int | None = None
+    stream: bool | None = None
+    conversation_id: str | None = None  # Decyra extension
+
+
+@app.post("/v1/chat/completions")
+def chat_completions(
+    payload: ChatCompletionRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db_read: Connection = Depends(get_db),
+    db_write: Connection = Depends(get_db_write),
+) -> dict:
+    """OpenAI-compatible chat proxy (non-streaming). EVERY call persists
+    the turn and writes an audit event — no path chats without auditing.
+
+    Two DB connections: db_read for history/ownership, db_write for the
+    persist. The LLM call happens between them, while db_write is still
+    idle (no statements, no locks) — the hash-chain advisory lock is only
+    taken at the final audit INSERT.
+    """
+    if payload.stream:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="streaming is not supported here (see Task 4.4)",
+        )
+
+    member = invitations.resolve_membership(db_read, user.user_id)
+    if member is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, detail="no workspace membership"
+        )
+    ws = member.workspace_id
+
+    model_row = db_read.execute(
+        text(
+            "SELECT provider, cost_input, cost_output FROM models "
+            "WHERE name = :m AND enabled = true"
+        ),
+        {"m": payload.model},
+    ).one_or_none()
+    if model_row is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"model '{payload.model}' is not available",
+        )
+
+    new_messages = [
+        {"role": m.role, "content": m.content} for m in payload.messages
+    ]
+
+    # History + ownership (Decyra mode). conversation_id wins over the
+    # messages array: stored history is always prepended.
+    set_workspace_context(db_read, ws)
+    if payload.conversation_id:
+        try:
+            UUID(payload.conversation_id)
+        except ValueError:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail="conversation not found"
+            )
+        owner = chat.load_conversation_owner(db_read, payload.conversation_id)
+        if owner is None or owner != user.user_id:
+            # 404 (not 403): don't reveal a colleague's conversation exists.
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail="conversation not found"
+            )
+        llm_input = chat.load_history(db_read, payload.conversation_id) + new_messages
+    else:
+        llm_input = new_messages
+
+    # LLM call — db_write still idle.
+    kwargs: dict = {"model": payload.model, "messages": llm_input}
+    if payload.temperature is not None:
+        kwargs["temperature"] = payload.temperature
+    if payload.max_tokens is not None:
+        kwargs["max_tokens"] = payload.max_tokens
+    resp = litellm.completion(**kwargs)
+    assistant_content = resp.choices[0].message.content or ""
+    cost = chat.compute_cost(
+        resp.usage.prompt_tokens,
+        resp.usage.completion_tokens,
+        model_row.cost_input,
+        model_row.cost_output,
+    )
+
+    # WRITE block (first statements on db_write). messages.workspace_id is
+    # always ws (the conversation's workspace), never request-derived.
+    set_workspace_context(db_write, ws)
+    if payload.conversation_id:
+        cid = payload.conversation_id
+    else:
+        cid = chat.create_conversation(
+            db_write, ws, user.user_id, chat.derive_title(new_messages)
+        )
+    for m in chat.persistable_messages(new_messages):
+        chat.insert_message(db_write, cid, ws, m["role"], m["content"])
+    chat.insert_message(
+        db_write,
+        cid,
+        ws,
+        "assistant",
+        assistant_content,
+        model=payload.model,
+        prompt_tokens=resp.usage.prompt_tokens,
+        completion_tokens=resp.usage.completion_tokens,
+        cost=cost,
+    )
+    chat.touch_conversation(db_write, cid)
+    chat.insert_audit_event(
+        db_write,
+        ws,
+        user.user_id,
+        payload.model,
+        chat.audit_request_text(new_messages),
+        assistant_content,
+        model_row.provider,
+    )
+    return chat.build_openai_response(resp, payload.model, cid)
+
+
+@app.get("/conversations")
+def list_conversations(
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: Connection = Depends(get_db),
+) -> list[dict]:
+    """The caller's OWN conversations (private). RLS scopes to the
+    workspace; the explicit user_id filter is the privacy layer."""
+    member = invitations.resolve_membership(db, user.user_id)
+    if member is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, detail="no workspace membership"
+        )
+    set_workspace_context(db, member.workspace_id)
+    rows = db.execute(
+        text(
+            "SELECT id, title, created_at, updated_at FROM conversations "
+            "WHERE user_id = :u ORDER BY updated_at DESC"
+        ),
+        {"u": user.user_id},
+    ).all()
+    return [
+        {
+            "id": str(r.id),
+            "title": r.title,
+            "created_at": r.created_at.isoformat(),
+            "updated_at": r.updated_at.isoformat(),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/conversations/{conversation_id}")
+def get_conversation(
+    conversation_id: UUID,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: Connection = Depends(get_db),
+) -> dict:
+    member = invitations.resolve_membership(db, user.user_id)
+    if member is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, detail="no workspace membership"
+        )
+    set_workspace_context(db, member.workspace_id)
+    conv = db.execute(
+        text(
+            "SELECT id, title, created_at, updated_at FROM conversations "
+            "WHERE id = :c AND user_id = :u"
+        ),
+        {"c": str(conversation_id), "u": user.user_id},
+    ).one_or_none()
+    if conv is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, detail="conversation not found"
+        )
+    msgs = db.execute(
+        text(
+            "SELECT role, content, model, created_at FROM messages "
+            "WHERE conversation_id = :c ORDER BY created_at ASC, id ASC"
+        ),
+        {"c": str(conversation_id)},
+    ).all()
+    return {
+        "id": str(conv.id),
+        "title": conv.title,
+        "created_at": conv.created_at.isoformat(),
+        "updated_at": conv.updated_at.isoformat(),
+        "messages": [
+            {
+                "role": m.role,
+                "content": m.content,
+                "model": m.model,
+                "created_at": m.created_at.isoformat(),
+            }
+            for m in msgs
+        ],
+    }
 
 
 @app.get("/workspaces/{workspace_id}/audit/verify")

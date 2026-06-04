@@ -202,6 +202,44 @@ def _patch_jwks(monkeypatch, test_ec_private_key):  # type: ignore[no-untyped-de
 
 
 @pytest.fixture(autouse=True)
+def stub_llm(monkeypatch):
+    """Patch litellm.completion so pytest never makes a real API call.
+    Returns a controller: `.state` to tune the next response (tokens/
+    content), `.calls` to inspect the messages the endpoint passed."""
+    import types
+
+    state = {
+        "content": "Hallo! Wie kann ich helfen?",
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "id": "chatcmpl-test",
+        "created": 1717000000,
+    }
+    calls: list[dict] = []
+
+    def _completion(**kwargs):  # type: ignore[no-untyped-def]
+        calls.append(kwargs)
+        pt, ct = state["prompt_tokens"], state["completion_tokens"]
+        message = types.SimpleNamespace(role="assistant", content=state["content"])
+        choice = types.SimpleNamespace(
+            index=0, message=message, finish_reason="stop"
+        )
+        usage = types.SimpleNamespace(
+            prompt_tokens=pt, completion_tokens=ct, total_tokens=pt + ct
+        )
+        return types.SimpleNamespace(
+            id=state["id"],
+            created=state["created"],
+            model=kwargs.get("model"),
+            choices=[choice],
+            usage=usage,
+        )
+
+    monkeypatch.setattr("litellm.completion", _completion)
+    return types.SimpleNamespace(state=state, calls=calls)
+
+
+@pytest.fixture(autouse=True)
 def mail_outbox(monkeypatch):
     """Stub SMTP so pytest never opens a socket (analogous to provider
     tests not needing real API keys). Returns the recorded sends so tests
