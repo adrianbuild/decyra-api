@@ -201,6 +201,20 @@ def _patch_jwks(monkeypatch, test_ec_private_key):  # type: ignore[no-untyped-de
     )
 
 
+@pytest.fixture(autouse=True)
+def mail_outbox(monkeypatch):
+    """Stub SMTP so pytest never opens a socket (analogous to provider
+    tests not needing real API keys). Returns the recorded sends so tests
+    can assert. Real Mailpit delivery is proven by a live smoke."""
+    sent: list[dict] = []
+
+    def _fake(to, token, role, settings):  # type: ignore[no-untyped-def]
+        sent.append({"to": to, "token": token, "role": role})
+
+    monkeypatch.setattr("app.mail.send_invitation_email", _fake)
+    return sent
+
+
 @pytest.fixture
 def make_token(test_ec_private_key):  # type: ignore[no-untyped-def]
     """Mint a Supabase-shaped ES256 JWT for tests."""

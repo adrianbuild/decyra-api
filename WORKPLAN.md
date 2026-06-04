@@ -112,13 +112,14 @@
 - [x] RLS-Beweis-Test (decyra_app, B unsichtbar, is_superuser=off) + Live-Smoke
 - **DoD:** RLS feuert zur Laufzeit, Cross-Tenant-Insert/-Read unmöglich ✅ (35 Tests grün)
 
-### Task 2.3 — Einladungen & Rollen
-- [ ] Einladungs-Token-Tabelle (token, workspace_id, email, role, expires_at)
-- [ ] Endpoint: User einladen (Owner/Admin), Einladungs-Mail mit Token-Link
-- [ ] Endpoint: Einladung annehmen (Token → workspace_member)
-- [ ] Permission-Helper canManage(user, action) mit Rollen-Logik
-- [ ] Endpoint: Rolle ändern, User deaktivieren (nur Owner/Admin)
-- **DoD:** Einladung funktioniert end-to-end, Rollen werden erzwungen
+### Task 2.3 — Einladungen & Rollen ✅ (2026-06-04)
+- [x] invitations-Tabelle (org-skopiert: organization_id, email, role, token, invited_by, status, expires_at) + RLS via app.current_organization_id + GRANTs
+- [x] Endpoint: User einladen (Owner/Admin), Einladungs-Mail via Mailpit (Token-Link)
+- [x] Einladung annehmen implizit über onboard_user beim Login (email-gebunden, kein separater Accept-Endpoint)
+- [x] Rollen-Helper require_role + SECURITY-DEFINER-Resolver current_user_membership
+- [x] GET /invitations + POST /invitations/{token}/revoke (Owner/Admin)
+- **DoD:** Einladung end-to-end, Rollen erzwungen ✅ (49 Tests grün, Mailpit-Live-Smoke)
+- Verschoben (war hier gelistet): „Rolle ändern / User deaktivieren" → bei Bedarf in 2.4/späterem Admin-Task; 2.3 deckt Einladen/Beitreten/Revoke ab.
 
 ### Task 2.4 — Multi-Tenant-Isolation (Test!)
 - [ ] Alle Queries gehen über workspace_id-gefilterte Helper

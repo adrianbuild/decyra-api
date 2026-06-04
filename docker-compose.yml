@@ -17,5 +17,16 @@ services:
       timeout: 5s
       retries: 10
 
+  # Local SMTP catcher (Task 2.3). Invitation mails land here, never go
+  # out. UI at http://localhost:8025, SMTP on :1025. Prod swaps the SMTP
+  # host/port in config — this service is dev-only.
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: decyra-mailpit
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    restart: unless-stopped
+
 volumes:
   decyra_pgdata:

@@ -8,7 +8,7 @@
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
-- [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [x] 2.2c decyra_app-Switch + RLS scharf; [ ] 2.3/2.4)
+- [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [x] 2.2c decyra_app-Switch + RLS scharf; [x] 2.3 Einladungen & Rollen; [ ] 2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
 - [~] Block 4 — Routing/Chat/PII ([~] 4.1 Phase A done, Phase B pending; [ ] 4.2/4.3/4.4/4.5/4.6)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
@@ -31,7 +31,18 @@
 - Bildgenerierung (5B.4): EU-Provider FLUX/Black Forest Labs — DPA und Souveränität vor Bau klären
 
 ## Security-Härtung vor Pilot (Task 2.2)
-Drei Punkte, die ZWINGEND vor erstem echten User/Pilot stehen müssen:
+Die drei 2.2-Punkte sind erledigt (siehe unten). NEU offen aus 2.3:
+
+0. **Email-Verifikation für Einladungen.** Die 2.3-Einladungen sind
+   EMAIL-gebunden: `onboard_user` matcht die Login-Email gegen
+   `invitations.email` (nicht den Token). Damit ist eine Einladung nur
+   so sicher wie die Email-Verifikation. Solange „Confirm email" im
+   Supabase-Dashboard AUS ist (Dev), könnte sich jemand mit einer
+   fremden eingeladenen Email registrieren und der Org beitreten.
+   → **Vor Pilot: „Confirm email" im Supabase-Dashboard AN.** Kein
+   Code-Blocker für 2.3, aber zwingend vor echten Usern.
+
+Die drei ursprünglichen Punkte:
 
 1. ~~**DB-Rolle decyra_app aktivieren.**~~ **Erledigt in 2.2c
    (2026-06-02).** App connectet jetzt als `decyra_app` (NOSUPERUSER,
@@ -64,6 +75,57 @@ Drei Punkte, die ZWINGEND vor erstem echten User/Pilot stehen müssen:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-04: Task 2.3 abgeschlossen. Einladungen & Rollen — mehrere
+  Mitarbeiter in einer Org. Migration `b8e4f2a16c9d` (down_revision
+  d3f7a1c95b2e).
+  - `invitations`-Tabelle (org-skopiert): id, organization_id FK,
+    email, role workspace_role, token UNIQUE, invited_by FK, status
+    (CHECK pending/accepted/expired/revoked), created_at, expires_at.
+    RLS via NEUE GUC `app.current_organization_id` (org-Daten ↔ org-
+    Kontext, getrennt von der ws-GUC). GRANT SELECT/INSERT/UPDATE
+    (KEIN DELETE — Historie).
+  - `onboard_user` ERWEITERT (Pfade 1+3 byte-identisch zu 2.2c): neuer
+    Eingeladenen-Pfad (2) zwischen Idempotenz und Gründer — email-
+    gebundener, pending, nicht-abgelaufener Invitation-Lookup → tritt
+    bestehender Org bei (Rolle aus Einladung), markiert accepted,
+    KEINE neue Org. SECURITY-DEFINER-Härtung beibehalten.
+  - `current_user_membership(uuid)` SECURITY DEFINER (search_path
+    gehärtet): löst user_id → (org, workspace, role) RLS-bypassed,
+    liefert role für require_role. REVOKE PUBLIC + GRANT EXECUTE.
+  - `app/invitations.py`: resolve_membership, require_role (403),
+    create/list/revoke (explizite org-Filter als defense-in-depth
+    ZUSÄTZLICH zur RLS), Token via secrets.token_urlsafe(32).
+  - `app/main.py`: set_org_context (Bind-Param, nie f-string),
+    POST/GET /invitations + POST /invitations/{token}/revoke, alle mit
+    require_role({owner,admin}); owner-Einladung → 400 (nur admin/user).
+  - `app/mail.py` (stdlib smtplib) + Mail-Config in config.py (Mailpit-
+    Defaults). docker-compose: Mailpit-Service (1025 SMTP / 8025 UI).
+  - Frontend decyra-web: `/team`-Seite (Server-Component listet
+    Einladungen) + Client-Form (einladen) + Revoke-Buttons; Dashboard-
+    Link auf /team. Funktional, nicht gestaltet.
+  - DOKUMENTIERTE EIGENSCHAFTEN (bewusst, keine Lücken): (a) email-
+    gebunden, nicht token-gebunden → braucht Email-Verifikation vor
+    Pilot (Security-Block Punkt 0); (b) bestehender User mit Org wird
+    eingeladen → Idempotenz-Pfad gewinnt, Einladung ignoriert (kein
+    Multi-Org jetzt); (c) abgelaufene Einladung bleibt 'pending'
+    (Zeitfilter expires_at>now()), Enum 'expired' bewusst ungenutzt,
+    kein Cleanup-Job.
+  - DEBUG (Diagnose vor Fix): erster pytest-Lauf 2 rote — `column
+    "workspace_id"/"role" is ambiguous` im Eingeladenen-INSERT. Echte
+    Reproduktion gegen die reale Funktion zeigte: Ursache war die
+    `ON CONFLICT (workspace_id, user_id)`-Klausel — `workspace_id` ist
+    OUT-Parameter der RETURNS-TABLE-Funktion und kollidiert unter
+    `variable_conflict=error`. Der Gründer-INSERT hat kein ON CONFLICT
+    → war nie betroffen. Fix: ON CONFLICT entfernt (unnötig — Pfad 1 +
+    advisory lock garantieren null Memberships im Eingeladenen-Pfad).
+  - Verifikation: `pytest -q` **49 grün** (35→49, +14 in
+    test_invitations.py inkl. RLS-cross-org-Daten-Test als decyra_app).
+    Mailpit-Stub in pytest (kein Socket). `npm run build` grün (8
+    Routen inkl. /team). Live-Smoke: `app.mail.send_invitation_email`
+    → Mailpit-API zeigt die Mail (To/Subject/Invite-Link korrekt).
+  - Scope: kein Sichtbarkeits-/Teilen-System, keine Mehrfach-Workspaces
+    pro Org, kein gestaltetes UI.
+
 - 2026-06-02: Task 2.2c abgeschlossen. decyra_app-Rollen-Switch, RLS
   scharf geschaltet. Live gegen die laufende Dev-DB inspiziert (rolcanlogin
   war f → LOGIN fehlte; in Migration gefixt).

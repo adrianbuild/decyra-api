@@ -38,6 +38,67 @@ def seed_workspace(db: Connection) -> tuple[str, str]:
     return ws_id, user_id
 
 
+def seed_org_with_owner(
+    db: Connection, owner_id: str, owner_email: str = "owner@firma.de"
+) -> tuple[str, str]:
+    """Org + workspace + an owner user(id=owner_id) + owner membership.
+    Returns (org_id, workspace_id)."""
+    org_id = db.execute(
+        text("INSERT INTO organizations (name) VALUES ('Acme') RETURNING id")
+    ).scalar_one()
+    ws_id = db.execute(
+        text(
+            "INSERT INTO workspaces (organization_id, name) "
+            "VALUES (:o, 'WS') RETURNING id"
+        ),
+        {"o": org_id},
+    ).scalar_one()
+    db.execute(
+        text("INSERT INTO users (id, email) VALUES (:i, :e)"),
+        {"i": owner_id, "e": owner_email},
+    )
+    db.execute(
+        text(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) "
+            "VALUES (:w, :u, 'owner')"
+        ),
+        {"w": ws_id, "u": owner_id},
+    )
+    return str(org_id), str(ws_id)
+
+
+def seed_invitation(
+    db: Connection,
+    org_id: str,
+    email: str,
+    invited_by: str,
+    role: str = "user",
+    status: str = "pending",
+    expires_days: int = 7,
+) -> str:
+    """Insert an invitation row. Returns its token."""
+    token = f"tok-{email}-{status}"
+    db.execute(
+        text(
+            "INSERT INTO invitations "
+            "(organization_id, email, role, token, invited_by, status, "
+            " expires_at) "
+            "VALUES (:o, :e, :r, :t, :u, :s, "
+            "        now() + make_interval(days => :d))"
+        ),
+        {
+            "o": org_id,
+            "e": email,
+            "r": role,
+            "t": token,
+            "u": invited_by,
+            "s": status,
+            "d": expires_days,
+        },
+    )
+    return token
+
+
 def add_member(
     db: Connection, ws_id: str, user_id: str, role: str = "owner"
 ) -> None:

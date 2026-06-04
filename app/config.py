@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     audit_verify_secret: str | None = None
     audit_verify_token_default_ttl_seconds: int = 60 * 60 * 24 * 30  # 30d
 
+    # Mail (Task 2.3). Defaults point at the local Mailpit catcher
+    # (docker-compose). Prod just swaps the SMTP host/port/from.
+    smtp_host: str = "localhost"
+    smtp_port: int = 1025
+    mail_from: str = "noreply@decyra.local"
+    # Used to build the invitation link in the email.
+    app_base_url: str = "http://localhost:3000"
+
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
     mistral_api_key: str | None = None

@@ -3,9 +3,11 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
+from app import invitations, mail
 from app.audit import verify_workspace_chain
 from app.auth import AuthenticatedUser, get_current_user
 from app.config import Settings, get_settings
@@ -83,6 +85,16 @@ def set_workspace_context(db: Connection, workspace_id: object) -> None:
     )
 
 
+def set_org_context(db: Connection, organization_id: object) -> None:
+    """Transaction-local RLS context for ORG-scoped tables (invitations).
+    Bound param, never an f-string. Separate GUC from the workspace one:
+    org data <-> org context, workspace data <-> workspace context."""
+    db.execute(
+        text("SELECT set_config('app.current_organization_id', :org, true)"),
+        {"org": str(organization_id)},
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -117,6 +129,75 @@ def onboarding(
         "workspace_name": result.workspace_name,
         "created": result.created,
     }
+
+
+class InvitationCreate(BaseModel):
+    email: str
+    role: str
+
+
+@app.post("/invitations")
+def create_invitation(
+    payload: InvitationCreate,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: Connection = Depends(get_db_write),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    """Create an email-bound invitation (Owner/Admin only). Sends a mail
+    via Mailpit best-effort and returns the invitation incl. a link the
+    owner can also share manually."""
+    member = invitations.resolve_membership(db, user.user_id)
+    invitations.require_role(member, invitations.MANAGER_ROLES)
+    if payload.role not in invitations.INVITABLE_ROLES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="role must be one of: admin, user",
+        )
+    assert member is not None  # require_role raised otherwise
+    set_org_context(db, member.organization_id)
+    inv = invitations.create_invitation(
+        db, member.organization_id, payload.email, payload.role, user.user_id
+    )
+    # Best-effort: a down SMTP must not roll back the created invitation.
+    try:
+        mail.send_invitation_email(
+            payload.email, inv["token"], payload.role, settings
+        )
+        inv["mail_sent"] = True
+    except Exception:
+        inv["mail_sent"] = False
+    inv["invite_link"] = f"{settings.app_base_url}/login?invite={inv['token']}"
+    return inv
+
+
+@app.get("/invitations")
+def list_invitations(
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: Connection = Depends(get_db),
+) -> list[dict]:
+    """List the own org's pending invitations (Owner/Admin only)."""
+    member = invitations.resolve_membership(db, user.user_id)
+    invitations.require_role(member, invitations.MANAGER_ROLES)
+    assert member is not None
+    set_org_context(db, member.organization_id)
+    return invitations.list_pending_invitations(db, member.organization_id)
+
+
+@app.post("/invitations/{token}/revoke")
+def revoke_invitation(
+    token: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: Connection = Depends(get_db_write),
+) -> dict[str, bool]:
+    """Revoke a pending invitation (Owner/Admin only). RLS scopes this to
+    the caller's org — a foreign-org token yields 404."""
+    member = invitations.resolve_membership(db, user.user_id)
+    invitations.require_role(member, invitations.MANAGER_ROLES)
+    assert member is not None
+    set_org_context(db, member.organization_id)
+    if not invitations.revoke_invitation(db, token, member.organization_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="invitation not found")
+    return {"revoked": True}
 
 
 @app.get("/workspaces/{workspace_id}/audit/verify")
