@@ -3,14 +3,14 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 4 — Routing/Chat/PII**: 4.1 Phase A abgeschlossen → als nächstes 4.1 Phase B (User trägt Provider-Keys ein und läuft `python scripts/test_providers.py`), dann 4.2 (Test-Frontend).
+**Block 4 — Routing/Chat/PII**: 4.2 (Chat-Frontend) abgeschlossen. Offen in Block 4: 4.1 Phase B (User trägt Provider-Keys ein, `python scripts/test_providers.py` → echte LLM-Antworten im Chat), dann 4.4 (Streaming) / 4.5 (PII) / 4.6 (Fehler/Fallback).
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
 - [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [x] 2.2c decyra_app-Switch + RLS scharf; [x] 2.3 Einladungen & Rollen; [ ] 2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
-- [~] Block 4 — Routing/Chat/PII ([~] 4.1 Phase A done, Phase B pending; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [ ] 4.2/4.4/4.5/4.6)
+- [~] Block 4 — Routing/Chat/PII ([~] 4.1 Phase A done, Phase B pending; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [ ] 4.4/4.5/4.6)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
 - [ ] Block 5B — Chat-Features (5B.1 Datei-Upload, 5B.2 Datenanalyse+Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects)
 - [ ] Block 6 — Frontend (6.1 Chat, 6.2 Dashboard Logs, 6.3 Dashboard Verwaltung)
@@ -75,6 +75,49 @@ Die drei ursprünglichen Punkte:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-04: Task 4.2 abgeschlossen. Chat-Frontend mit Konversations-
+  Verwaltung (decyra-web) + EIN Backend-Touch (`GET /models`).
+  - **Backend (decyra-api):** `GET /models` in `app/main.py` — JWT via
+    `get_current_user`, nur `enabled=true`, Form `[{name, provider}]`.
+    `models` ist RLS-frei (1.3) → KEIN `set_workspace_context`, KEINE
+    Membership-Prüfung; jeder eingeloggte User darf die Liste sehen.
+    `eu_hosted`/`sovereign_eligible` bewusst RAUS (späterer Einzeiler
+    fürs Sovereign-Badge). `tests/test_models.py` (2 Tests): requires-
+    auth (401) + only-enabled (disabled fällt raus, genau {name,
+    provider}). **`pytest -q` 62 grün** (60→62).
+  - **Frontend (decyra-web):** neue `/chat`-Route. Server-Shell
+    `chat/page.tsx` (nur Auth-Guard wie /team) + Client-Insel
+    `chat/chat-client.tsx` (interaktiv) + `chat/api.ts` (Fetch-Helfer).
+    `authHeaders()` 1:1 aus team-actions.tsx übernommen (Browser-
+    Supabase → getSession → Bearer) — NICHT neu erfunden.
+  - Layout: Seitenleiste (Konv.-Liste + „Neue Unterhaltung", aktiver
+    Eintrag via bg-sidebar-accent) links, Chat-Bereich rechts (Modell-
+    Select im Header, scrollbarer Verlauf, Textarea unten). shadcn-
+    sauber, Branding/Fonts bewusst generisch (Geist), nur Tokens.
+  - `conversation_id`-Fluss: Send schickt NUR die neue user-Nachricht +
+    `conversation_id ?? undefined` (Backend prependet die Historie
+    selbst → keine Doppel-Historie). Bei neuer Konv. (activeConvId=null)
+    kommt die ID aus der Response → wird übernommen, danach
+    `GET /conversations` refresh → neue Konv. erscheint in der Liste.
+  - Lade-Zustand (non-streaming, dauert Sek.): assistant-Platzhalter mit
+    Loader + Skeleton „denkt…", Textarea + Senden-Button disabled, Enter-
+    Submit blockiert → kein Doppel-Send. Enter sendet, Shift+Enter =
+    Zeilenumbruch.
+  - Fehler sichtbar: `api.ts` wirft mit `detail` aus 4.3 (oder Status);
+    `chat-client` → sonner-Toast (destructive) + Inline-`role=alert`.
+    Optimistische user-Nachricht bleibt bei Fehler stehen (Retry).
+  - `selectedModel` beim Konv.-Wechsel/Neu BEWUSST nicht zurückgesetzt
+    (bleibt User-Wahl; Modell-pro-Nachricht-Mischen ok, 4.3 speichert
+    message.model). Kein undefinierter Zustand.
+  - shadcn nachinstalliert: input, textarea, scroll-area, select, card,
+    skeleton, sonner (zog next-themes + sonner als deps). `<Toaster />`
+    in `layout.tsx`. „Chat"-Link im Dashboard neben „Team".
+  - Verifikation: `npm run build` grün (TS strict, 10 Routen inkl.
+    `/chat` 43.4 kB). Echte LLM-Antworten = 4.1 Phase B (Keys). Manueller
+    Browser-Test (DoD) durch User.
+  - Scope: kein Verify-Badge (Option A), kein Branding, kein Streaming
+    (4.4), kein Löschen/Umbenennen/Teilen, kein Markdown-Rendering.
+
 - 2026-06-04: Task 4.3 abgeschlossen. Chat-Proxy mit persistenten
   Konversationen — der ERSTE echte audit_events-Producer (Block 3 ⨯
   Block 4). Migration `c5d9e1f0a2b3` (down_revision b8e4f2a16c9d).

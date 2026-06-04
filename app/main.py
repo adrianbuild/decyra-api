@@ -119,6 +119,25 @@ def me(
     return {"user_id": user.user_id, "email": user.email}
 
 
+@app.get("/models")
+def list_models(
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: Connection = Depends(get_db),
+) -> list[dict]:
+    """Enabled models for the model picker. The ``models`` table is RLS-free
+    (Task 1.3) — no workspace context, no membership check; any authenticated
+    user may see the available models. eu_hosted/sovereign_eligible are
+    deliberately omitted (a later one-liner adds them for the sovereign
+    badge)."""
+    rows = db.execute(
+        text(
+            "SELECT name, provider FROM models WHERE enabled = true "
+            "ORDER BY provider, name"
+        )
+    ).all()
+    return [{"name": r.name, "provider": r.provider} for r in rows]
+
+
 @app.post("/onboarding")
 def onboarding(
     user: AuthenticatedUser = Depends(get_current_user),

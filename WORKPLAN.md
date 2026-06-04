@@ -160,10 +160,15 @@
 - **DoD Phase A:** Code + Seed + Test-Skript gebaut, 28/28 Tests grün, Migration appliziert
 - **DoD Phase B (User-Action nach Key-Eintrag, iterativ):** alle 6 aktiven Modelle antworten auf "Hello"; ggf. Model-IDs / Preise in `MODELS` korrigieren und re-seeden
 
-### Task 4.2 — Minimales Test-Frontend (früh!)
-- [ ] Einfache Chat-Seite: Texteingabe, Senden, Antwort anzeigen, Modell-Dropdown
-- [ ] Ruft Backend-Chat-Endpoint auf (auch wenn noch nicht alles fertig)
-- **DoD:** du kannst im Browser eine Anfrage abschicken statt nur mit curl zu testen
+### Task 4.2 — Chat-Frontend mit Konversations-Verwaltung ✅ (2026-06-04)
+- [x] `/chat`-Route: Seitenleiste (Konversations-Liste + „Neue Unterhaltung") + Chat-Bereich (Verlauf, Eingabe, Modell-Dropdown)
+- [x] Senden → Antwort anzeigen, non-streaming Lade-Zustand („denkt…" + Eingabe gesperrt, kein Doppel-Send)
+- [x] Modell-Dropdown aus neuem `GET /models` (JWT, nur enabled, {name, provider})
+- [x] Konversation wechseln lädt Verlauf; neue Konversation → `conversation_id`-Übernahme aus der Response (Folge-Nachrichten in dieselbe Konv.)
+- [x] Fehler sichtbar (sonner-Toast + Inline), nicht still geschluckt
+- [x] Client-Component reuse des `authHeaders()`-Musters aus /team (Browser-Supabase → getSession → Bearer)
+- **DoD:** du kannst im Browser eine Anfrage abschicken statt nur mit curl zu testen ✅ (`npm run build` grün, 62 Backend-Tests grün; manueller Browser-Test durch User)
+- Bewusst raus (geklärt): Verify-Badge (Option A), eigenes Branding/Fonts, Streaming (4.4), Löschen/Umbenennen, Teilen, Markdown-Rendering
 - *Begründung: spart ab jetzt bei jedem weiteren Task Test-Zeit*
 
 ### Task 4.3 — Chat-Proxy-Endpoint ✅ (2026-06-04)
