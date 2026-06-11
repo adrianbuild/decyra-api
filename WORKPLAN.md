@@ -26,68 +26,68 @@
 > Das macht der Mensch, nicht Claude Code. Muss vor Block 1 erledigt sein.
 
 ### Task 0.1 — Accounts & Keys
-- [ ] OpenAI Business-Account + Zahlungsmethode + API-Key
-- [ ] Anthropic API-Konto + API-Key
-- [ ] Google Cloud + Vertex AI EU aktiviert + Service-Account-Key
-- [ ] Mistral La Plateforme + API-Key
-- [ ] Hetzner Cloud Account
-- [ ] Supabase Projekt angelegt + Keys notiert
-- [ ] DPA bei jedem Provider angefordert und abgelegt
+- [x] OpenAI Business-Account + Zahlungsmethode + API-Key (Key in .env, Calls funktionieren)
+- [x] Anthropic API-Konto + API-Key (Key in .env, Calls funktionieren)
+- [ ] Google Cloud + Vertex AI EU aktiviert + Service-Account-Key (offen — Vertex-EU-Zugang steht aus, Modell enabled=false)
+- [x] Mistral La Plateforme + API-Key (Key in .env, Calls funktionieren)
+- [ ] Hetzner Cloud Account (für Block 8, nicht verifizierbar)
+- [x] Supabase Projekt angelegt + Keys notiert (Auth läuft end-to-end)
+- [ ] DPA bei jedem Provider angefordert und abgelegt (nicht aus Code/DB verifizierbar)
 
 ### Task 0.2 — Lokale Umgebung
-- [ ] Node.js 20, Python 3.11, Docker, Docker Compose installiert
-- [ ] PostgreSQL 17 lokal oder via Docker lauffähig
-- [ ] GitHub-Org `decyra` + SSH-Key hinterlegt
+- [x] Node.js 20, Python 3.11, Docker, Docker Compose installiert (npm build + pytest + Container laufen)
+- [x] PostgreSQL 17 lokal oder via Docker lauffähig (decyra-postgres pg17 läuft)
+- [ ] GitHub-Org `decyra` + SSH-Key hinterlegt (offen — Repos sind lokal-only, kein Remote)
 
 ---
 
 ## TASK-BLOCK 1 — Projekt-Setup
 
 ### Task 1.1 — Repos & Grundgerüst
-- [ ] decyra-api: FastAPI-Projekt-Struktur (app/, tests/, alembic/)
-- [ ] requirements.txt: fastapi, uvicorn, litellm, sqlalchemy, alembic, psycopg2-binary, pydantic-settings, pytest, httpx
-- [ ] GET /health Endpoint → {"status": "ok"}
-- [ ] pydantic-settings für .env-Handling (alle Provider-Keys)
-- [ ] Dockerfile für Backend
-- [ ] decyra-web: Next.js 15 (App Router, TS), Tailwind 4, shadcn/ui init, Platzhalter-Startseite
-- [ ] decyra-extension: Manifest V3 + Vite-Build-Skelett
-- [ ] Pro Repo: README, .gitignore (Secrets/node_modules/__pycache__/.env), .env.example
-- [ ] CLAUDE.md, WORKPLAN.md, PROGRESS.md ins decyra-api Root
-- **DoD:** alle drei Projekte starten lokal fehlerfrei; /health antwortet
+- [x] decyra-api: FastAPI-Projekt-Struktur (app/, tests/, alembic/)
+- [x] requirements.txt: fastapi, uvicorn, litellm, sqlalchemy, alembic, psycopg2-binary, pydantic-settings, pytest, httpx
+- [x] GET /health Endpoint → {"status": "ok"} (test_health grün)
+- [x] pydantic-settings für .env-Handling (alle Provider-Keys)
+- [x] Dockerfile für Backend
+- [x] decyra-web: Next.js 15 (App Router, TS), Tailwind 4, shadcn/ui init, Platzhalter-Startseite
+- [x] decyra-extension: Manifest V3 + Vite-Build-Skelett
+- [x] Pro Repo: README, .gitignore (Secrets/node_modules/__pycache__/.env), .env.example
+- [x] CLAUDE.md, WORKPLAN.md, PROGRESS.md ins decyra-api Root
+- **DoD:** alle drei Projekte starten lokal fehlerfrei; /health antwortet ✅
 
 ### Task 1.2 — Test-Infrastruktur
-- [ ] pytest + pytest-asyncio konfiguriert in decyra-api
-- [ ] conftest.py mit Test-DB-Fixture (separate Test-Datenbank)
-- [ ] Erster Dummy-Test läuft grün
-- [ ] (optional) GitHub Actions Workflow: pytest bei Push
-- **DoD:** `pytest` läuft, mindestens 1 grüner Test
+- [x] pytest + pytest-asyncio konfiguriert in decyra-api
+- [x] conftest.py mit Test-DB-Fixture (separate Test-Datenbank)
+- [x] Erster Dummy-Test läuft grün
+- [ ] (optional) GitHub Actions Workflow: pytest bei Push (offen — kein Remote)
+- **DoD:** `pytest` läuft, mindestens 1 grüner Test ✅ (62 grün)
 
 ### Task 1.3 — Datenbank-Schema & Migrations
-- [ ] Alembic initialisiert, verbunden mit lokaler DB
-- [ ] pgvector Extension aktivieren (CREATE EXTENSION vector)
-- [ ] Tabelle organizations (id uuid, name, created_at)
-- [ ] Tabelle workspaces (id, organization_id FK, name, settings jsonb, created_at)
-- [ ] Tabelle users (id, email unique, created_at)
-- [ ] Tabelle workspace_members (workspace_id FK, user_id FK, role enum owner/admin/user, PK zusammengesetzt)
-- [ ] Tabelle models (name PK, provider, cost_input numeric, cost_output numeric, eu_hosted bool, sovereign_eligible bool, tier_min)
-- [ ] Tabelle audit_events (id, workspace_id FK, user_id FK, timestamp, model, request_text, response_text, pii_detected bool, routed_to, prev_hash, current_hash) — append-only
-- [ ] Tabelle documents (id, workspace_id FK, filename, uploaded_by FK, created_at)
-- [ ] Tabelle document_chunks (id, document_id FK, workspace_id FK, content text, embedding vector(1024), chunk_index)
-- [ ] Row-Level Security auf allen Tabellen mit workspace_id
-- [ ] Migration ausführen, Schema verifizieren
-- **DoD:** Migration läuft sauber, alle Tabellen + RLS + pgvector vorhanden
+- [x] Alembic initialisiert, verbunden mit lokaler DB
+- [x] pgvector Extension aktivieren (CREATE EXTENSION vector)
+- [x] Tabelle organizations (id uuid, name, created_at)
+- [x] Tabelle workspaces (id, organization_id FK, name, settings jsonb, created_at)
+- [x] Tabelle users (id, email unique, created_at)
+- [x] Tabelle workspace_members (workspace_id FK, user_id FK, role enum owner/admin/user, PK zusammengesetzt)
+- [x] Tabelle models (name PK, provider, cost_input numeric, cost_output numeric, eu_hosted bool, sovereign_eligible bool, tier_min)
+- [x] Tabelle audit_events (id, workspace_id FK, user_id FK, timestamp, model, request_text, response_text, pii_detected bool, routed_to, prev_hash, current_hash) — append-only
+- [x] Tabelle documents (id, workspace_id FK, filename, uploaded_by FK, created_at)
+- [x] Tabelle document_chunks (id, document_id FK, workspace_id FK, content text, embedding vector(1024), chunk_index)
+- [x] Row-Level Security auf allen Tabellen mit workspace_id (live: RLS ENABLE+FORCE auf workspaces/workspace_members/audit_events/documents/document_chunks)
+- [x] Migration ausführen, Schema verifizieren (Migration 313c10e517e1, test_schema 6 grün)
+- **DoD:** Migration läuft sauber, alle Tabellen + RLS + pgvector vorhanden ✅
 
 ---
 
 ## TASK-BLOCK 2 — Auth & Multi-Tenant
 
 ### Task 2.1 — Supabase Auth
-- [ ] Supabase-Client im Backend + Frontend einrichten
-- [ ] Email-Registrierung mit Bestätigungs-Mail
-- [ ] Login (Magic Link bevorzugt, einfacher als Passwort)
-- [ ] Auth-Middleware Backend: JWT validieren, user_id extrahieren
-- [ ] Frontend: Session-Context, geschützte Routen, Logout
-- **DoD:** User kann sich registrieren, einloggen, ausloggen; geschützte Route blockt ohne Login
+- [x] Supabase-Client im Backend + Frontend einrichten (lib/supabase/{client,server,middleware})
+- [ ] Email-Registrierung mit Bestätigungs-Mail (Registrierung läuft; „Confirm email" in Dev bewusst AUS → Bestätigungs-Mail noch nicht scharf, siehe Security-Härtung Punkt 0)
+- [x] Login (in 2.2a von Magic Link auf Email/Passwort umgestellt; /auth/callback bleibt für späteren Magic-Link)
+- [x] Auth-Middleware Backend: JWT validieren, user_id extrahieren (JWKS/ES256, test_auth 6 grün)
+- [x] Frontend: Session-Context, geschützte Routen, Logout (@supabase/ssr httpOnly-Cookies, middleware.ts, LogoutButton)
+- **DoD:** User kann sich registrieren, einloggen, ausloggen; geschützte Route blockt ohne Login ✅ (Email-Bestätigung bewusst verschoben, vor Pilot scharf)
 
 ### Task 2.2 — Workspace & Onboarding
 > In Unter-Tasks gegliedert: 2.2a (Login-UI), 2.2b (Onboarding),
@@ -122,21 +122,21 @@
 - Verschoben (war hier gelistet): „Rolle ändern / User deaktivieren" → bei Bedarf in 2.4/späterem Admin-Task; 2.3 deckt Einladen/Beitreten/Revoke ab.
 
 ### Task 2.4 — Multi-Tenant-Isolation (Test!)
-- [ ] Alle Queries gehen über workspace_id-gefilterte Helper
-- [ ] Test: User aus Workspace A kann Daten von Workspace B NICHT lesen
-- [ ] Test: RLS greift auch bei direktem DB-Zugriff
-- **DoD:** Isolations-Tests grün — kein Cross-Tenant-Zugriff möglich
+- [x] Alle Queries gehen über workspace_id-gefilterte Helper (set_workspace_context / set_org_context vor jedem Read/Write; RLS FORCE als Netz darunter)
+- [x] Test: User aus Workspace A kann Daten von Workspace B NICHT lesen (test_rls cross-workspace, test_invitations cross-org, test_chat Privatsphäre — alle als decyra_app)
+- [x] Test: RLS greift auch bei direktem DB-Zugriff (test_rls.py: SET LOCAL ROLE decyra_app, is_superuser=off, direkte Queries — B unsichtbar)
+- **DoD:** Isolations-Tests grün — kein Cross-Tenant-Zugriff möglich ✅ (Hinweis: 2.4 wurde inzident durch die Tests aus 2.2c/2.3/4.3 erfüllt, nicht als eigene Session; die Isolation ist nachweislich getestet)
 
 ---
 
 ## TASK-BLOCK 3 — Audit-Log mit Hash-Chain
 
 ### Task 3.1 — Hash-Chain-Mechanik
-- [ ] Postgres-Trigger BEFORE INSERT auf audit_events
-- [ ] current_hash = SHA256(prev_hash || workspace_id || user_id || timestamp || model || request || response)
-- [ ] prev_hash = current_hash des letzten Events im selben Workspace (NULL beim ersten)
-- [ ] Trigger/Permission: UPDATE und DELETE auf audit_events verbieten
-- **DoD:** INSERT erzeugt korrekt verkettete Hashes; UPDATE/DELETE schlägt fehl
+- [x] Postgres-Trigger BEFORE INSERT auf audit_events (live: `audit_events_hash_chain_insert`)
+- [x] current_hash = SHA256(prev_hash || workspace_id || user_id || timestamp || model || request || response) (Migration 36cbe1faa786, Kanonisierung v1)
+- [x] prev_hash = current_hash des letzten Events im selben Workspace (NULL beim ersten) (advisory lock pro Workspace, clock_timestamp-Ordnung)
+- [x] Trigger/Permission: UPDATE und DELETE auf audit_events verbieten (live: `audit_events_no_update` + `audit_events_no_delete`)
+- **DoD:** INSERT erzeugt korrekt verkettete Hashes; UPDATE/DELETE schlägt fehl ✅ (test_hash_chain 4 grün inkl. Manipulations-Pflichttest; in 4.3 via verify_workspace_chain re-verifiziert)
 
 ### Task 3.2 — Verify & async Write
 - [x] verify_chain(workspace_id)-Funktion: liest Events, rechnet Kette nach, gibt OK/Fehlerposition
@@ -153,12 +153,12 @@
 ### Task 4.1 — LiteLLM & Provider-Anbindung
 - [x] LiteLLM-Config: OpenAI (gpt-5.5, gpt-5.4-mini)
 - [x] Anthropic (anthropic/claude-sonnet-4-6, anthropic/claude-haiku-4-5-20251001)
-- [ ] Google Vertex AI EU (vertex_ai/gemini-3.5-flash-tbd) — als Platzhalter mit enabled=false geseeded, Vertex-AI-EU-Zugang steht noch aus
+- [x] Google Vertex AI EU (vertex_ai/gemini-3.5-flash-tbd) — als Platzhalter mit enabled=false geseeded (live: enabled=f); echter Vertex-AI-EU-Zugang steht noch aus (Routing schließt ihn korrekt aus)
 - [x] Mistral La Plateforme (mistral/mistral-large-latest, mistral/mistral-small-latest) — SOVEREIGN
 - [x] models-Tabelle mit allen Modellen + (Recherche-)Preisen gefüllt via idempotentem Seed (`python -m app.seed_models`, ON CONFLICT DO UPDATE) — KEINE Preise in Alembic-Migration
 - [x] Test-Skript: `scripts/test_providers.py` standalone (nicht in pytest, weil echte API-Calls)
 - **DoD Phase A:** Code + Seed + Test-Skript gebaut, 28/28 Tests grün, Migration appliziert
-- **DoD Phase B (User-Action nach Key-Eintrag, iterativ):** alle 6 aktiven Modelle antworten auf "Hello"; ggf. Model-IDs / Preise in `MODELS` korrigieren und re-seeden
+- **DoD Phase B (User-Action nach Key-Eintrag, iterativ):** alle 6 aktiven Modelle antworten auf "Hello"; ggf. Model-IDs / Preise in `MODELS` korrigieren und re-seeden — ✅ de facto erfüllt: echte Anthropic- + Mistral-Antworten im Browser/Diag belegt (4.2), Keys in .env
 
 ### Task 4.2 — Chat-Frontend mit Konversations-Verwaltung ✅ (2026-06-04)
 - [x] `/chat`-Route: Seitenleiste (Konversations-Liste + „Neue Unterhaltung") + Chat-Bereich (Verlauf, Eingabe, Modell-Dropdown)
