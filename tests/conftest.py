@@ -321,6 +321,35 @@ def stub_llm(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def stub_pii(monkeypatch):
+    """Patch app.pii.contains_pii so pytest never calls Presidio. Default:
+    CLEAN (no reroute) → the 70 pre-4.5a tests are unaffected. Controller
+    `.state`: `force` in {None,'clean','detected','unavailable'} overrides;
+    otherwise PII is 'detected' iff `needle` is a substring of the scanned
+    text (so tests can prove the FULL llm_input incl. history is scanned)."""
+    import types
+
+    from app.pii import PiiOutcome
+
+    state = {"force": None, "needle": "__PII__"}
+
+    def _fake(text, settings=None):  # type: ignore[no-untyped-def]
+        force = state["force"]
+        if force == "unavailable":
+            return PiiOutcome("unavailable", False)
+        if force == "detected":
+            return PiiOutcome("detected", True)
+        if force == "clean":
+            return PiiOutcome("clean", False)
+        if state["needle"] and state["needle"] in text:
+            return PiiOutcome("detected", True)
+        return PiiOutcome("clean", False)
+
+    monkeypatch.setattr("app.pii.contains_pii", _fake)
+    return types.SimpleNamespace(state=state)
+
+
+@pytest.fixture(autouse=True)
 def mail_outbox(monkeypatch):
     """Stub SMTP so pytest never opens a socket (analogous to provider
     tests not needing real API keys). Returns the recorded sends so tests

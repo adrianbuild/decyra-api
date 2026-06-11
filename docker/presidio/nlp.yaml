@@ -1,0 +1,8 @@
+# Presidio NLP engine configuration — German (Task 4.5a).
+# Declares the German spaCy model so the analyzer's supported languages
+# include "de" and PERSON/LOCATION NER runs on German text. We always call
+# /analyze with language="de".
+nlp_engine_name: spacy
+models:
+  - lang_code: de
+    model_name: de_core_news_md

@@ -63,12 +63,12 @@ def audit_request_text(messages: list[dict]) -> str:
 
 
 def build_openai_response(
-    resp, model: str, conversation_id: str
+    resp, model: str, conversation_id: str, status: dict | None = None
 ) -> dict:
     """Shape the litellm response as an OpenAI chat.completion, plus our
-    conversation_id extension."""
+    conversation_id and (4.5a) the Decyra PII/routing status block."""
     choice = resp.choices[0]
-    return {
+    out = {
         "id": resp.id,
         "object": "chat.completion",
         "created": resp.created,
@@ -90,6 +90,9 @@ def build_openai_response(
         },
         "conversation_id": conversation_id,
     }
+    if status is not None:
+        out["decyra"] = status
+    return out
 
 
 # --- DB helpers ---------------------------------------------------------
@@ -180,14 +183,18 @@ def insert_audit_event(
     request_text: str,
     response_text: str,
     routed_to: str,
+    pii_detected: bool = False,
 ) -> None:
     """Append an audit event. The BEFORE INSERT trigger (3.1) chains the
-    hashes. Same template as tests/_helpers.insert_event."""
+    hashes. ``model``/``routed_to`` are the EFFECTIVE model/provider (after
+    any sovereign reroute). ``pii_detected`` is true only when PII was
+    actually detected — a degraded (Presidio-down) reroute leaves it false
+    (distinguishable; see Task 4.5a)."""
     db.execute(
         text(
             "INSERT INTO audit_events (workspace_id, user_id, model, "
-            "request_text, response_text, routed_to) "
-            "VALUES (:w, :u, :m, :req, :res, :routed)"
+            "request_text, response_text, routed_to, pii_detected) "
+            "VALUES (:w, :u, :m, :req, :res, :routed, :pii)"
         ),
         {
             "w": workspace_id,
@@ -196,6 +203,7 @@ def insert_audit_event(
             "req": request_text,
             "res": response_text,
             "routed": routed_to,
+            "pii": pii_detected,
         },
     )
 
@@ -246,10 +254,12 @@ def persist_stream_turn(
     provider: str,
     cost_input: float,
     cost_output: float,
+    pii_detected: bool = False,
 ) -> str | None:
     """Persist a streamed turn + write the audit event — byte-for-byte the
     same write block as the 4.3 non-streaming path, only sourcing the
-    assistant content/usage from the collected chunks. Creates the
+    assistant content/usage from the collected chunks. ``model``/``provider``/
+    prices are the EFFECTIVE model (after any sovereign reroute). Creates the
     conversation when ``existing_cid`` is None (so an aborted turn that
     produced nothing leaves NO orphan — decyra_app cannot DELETE
     conversations). Returns the conversation id, or None if nothing was
@@ -288,6 +298,7 @@ def persist_stream_turn(
         audit_request_text(new_messages),
         assistant_content,
         provider,
+        pii_detected,
     )
     return cid
 
@@ -355,3 +366,34 @@ def sse_error(message: str, conversation_id: str | None = None) -> str:
 
 def sse_done() -> str:
     return "data: [DONE]\n\n"
+
+
+def pii_status(
+    *,
+    pii_detected: bool,
+    pii_check: str,
+    routed_to: str,
+    effective_model: str,
+) -> dict:
+    """The Decyra PII/routing status block (Task 4.5a). anonymized is always
+    false in 4.5a — schema-stable for 4.5b (strict mode)."""
+    return {
+        "pii_detected": pii_detected,
+        "pii_check": pii_check,
+        "routed_to": routed_to,
+        "effective_model": effective_model,
+        "anonymized": False,
+    }
+
+
+def sse_status(status: dict) -> str:
+    """First SSE event: an OpenAI-shaped chunk with an empty delta carrying
+    the Decyra status. Emitted BEFORE the provider chunks (the PII/routing
+    decision is known pre-stream) so the client can show the notice at once."""
+    d = {
+        "id": "chatcmpl-decyra",
+        "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+        "decyra": status,
+    }
+    return f"data: {json.dumps(d)}\n\n"

@@ -3,14 +3,14 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 4 — Routing/Chat/PII**: 4.4 (Streaming) abgeschlossen. Offen in Block 4: 4.5 (PII-Routing) und 4.6 (Fehler/Fallback). 4.1 Phase B de facto erledigt (echte Anthropic/Mistral-Antworten laufen).
+**Block 4 — Routing/Chat/PII**: 4.5a (PII-Erkennung + Sovereign-Routing) abgeschlossen. Offen in Block 4: 4.5b (Strict-Modus) und 4.6 (Fehler/Fallback).
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
 - [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [x] 2.2c decyra_app-Switch + RLS scharf; [x] 2.3 Einladungen & Rollen; [ ] 2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
-- [~] Block 4 — Routing/Chat/PII ([x] 4.1 Phase A; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [x] 4.4 Streaming; [ ] 4.5/4.6)
+- [~] Block 4 — Routing/Chat/PII ([x] 4.1 Phase A; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [x] 4.4 Streaming; [x] 4.5a PII-Erkennung + Sovereign-Routing; [ ] 4.5b Strict / [ ] 4.6)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
 - [ ] Block 5B — Chat-Features (5B.1 Datei-Upload, 5B.2 Datenanalyse+Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects)
 - [ ] Block 6 — Frontend (6.1 Chat, 6.2 Dashboard Logs, 6.3 Dashboard Verwaltung)
@@ -31,7 +31,26 @@
 - Bildgenerierung (5B.4): EU-Provider FLUX/Black Forest Labs — DPA und Souveränität vor Bau klären
 
 ## Security-Härtung vor Pilot (Task 2.2)
-Die drei 2.2-Punkte sind erledigt (siehe unten). NEU offen aus 2.3:
+Die drei 2.2-Punkte sind erledigt (siehe unten). NEU aus 4.5a (bewusste
+Eigenschaften, vor Pilot bewerten):
+
+- **PII-Erkennung ist statistisch.** NER + Regex → Falsch-Negative real
+  (firmenspezifische Kundennummern, unüblich formatierte PII, englische
+  Namen unter dem `de`-Modell). 4.5a SENKT das Leak-Risiko, GARANTIERT keine
+  100%-Erkennung. Vor Pilot: Erkennungsrate an echten Kundendaten messen,
+  ggf. Custom-Recognizer ergänzen.
+- **DSGVO-Spannungsfeld (offen):** Original-`request_text` mit PII liegt in
+  der append-only-Hash-Kette (unlöschbar) vs. DSGVO-Löschrecht. Lösungs-
+  konzept (z.B. Krypto-Shredding / Pseudonymisierung des Audit-Texts) steht
+  aus — vor echten Personendaten klären.
+- **Degraded-Reroute nicht audit-unterscheidbar:** ein fail-safe-Reroute bei
+  Presidio-Ausfall (`pii_detected=false`, `routed_to=mistral`) ist in
+  `audit_events` nicht vom Clean-Mistral-Fall trennbar; nur via Log +
+  Response sichtbar. Kandidat: `pii_check`-Status-Feld in `audit_events`.
+- **`resp.model` wird nicht mitgeloggt** (aus 4.2-Diagnose) — Audit-Härtung-
+  Kandidat zusammen mit dem `completed`-Flag aus 4.4.
+
+NEU offen aus 2.3:
 
 0. **Email-Verifikation für Einladungen.** Die 2.3-Einladungen sind
    EMAIL-gebunden: `onboard_user` matcht die Login-Email gegen
@@ -75,6 +94,62 @@ Die drei ursprünglichen Punkte:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-11: Task 4.5a abgeschlossen. PII-Erkennung + Sovereign-Routing
+  (decyra-api + decyra-web). WORKPLAN-DoD: sensibler Prompt geht nie
+  ungeschützt an ein Nicht-Sovereign-Modell.
+  - **`app/pii.py` (neu):** zwei Schichten, OR → ein Boolean. (1) Lokale
+    deutsche Regex (Presidios Lücke): Steuer-ID mit ISO-7064-Mod-11,10-
+    Prüfziffer; Kundennummer keyword-verankert (`Kundennummer`/`Kd-Nr` +
+    Ziffern). (2) Presidio via httpx `POST /analyze {text, language:"de",
+    score_threshold}`. `contains_pii` → `PiiOutcome{status, detected}` mit
+    `needs_protection = detected OR status=='unavailable'`. Presidio-Fehler/
+    unkonfiguriert → `unavailable` (fail-safe).
+  - **Einfügestelle (`main.py`):** nach `llm_input`-Aufbau, vor der stream-
+    Verzweigung → scannt den GANZEN Input (Historie+neu, Invariante 1),
+    deckt beide Pfade, Entscheidung vor dem LLM-Call (→ Notiz ins erste
+    SSE-Event). `_pii_mode` liest `workspaces.settings->>'pii_mode'`
+    (unbekannt/fehlend → `sovereign`). `_resolve_effective_model`: Reroute
+    wenn `needs_protection AND not chosen.sovereign_eligible` → `settings.
+    sovereign_model` (validiert enabled+sovereign_eligible), sonst 503.
+  - **Einbahn-Ratsche (automatisch+nötig):** weil der ganze `llm_input`
+    inkl. Historie gescannt wird, hält PII aus einem Turn die Konversation
+    auf Sovereign — die Historie wird mitgesendet, ein späterer Nicht-
+    Sovereign-Call würde sie leaken.
+  - **Cost/Audit/persist mit EFFEKTIVEM Modell** (Reroute → Ziel-Preise/
+    -Provider). `insert_audit_event(..., pii_detected)`; `pii_detected=true`
+    NUR bei echter Erkennung → Degraded-Reroute (`false` + `pii_check=
+    unavailable` + `logger.warning`) ist davon unterscheidbar. `request_text`
+    bleibt Original.
+  - **Status-Felder** (schema-stabil für 4.5b): `pii_detected, pii_check,
+    routed_to, effective_model, anonymized(=false)`. non-stream: `decyra`-
+    Block in der Response; stream: erstes Event `chat.sse_status(...)` vor
+    den Provider-Chunks, `conversation_id` bleibt final.
+  - **Sovereign-Ziel** = `mistral/mistral-large-latest` (config `sovereign_
+    model`). Large für Antwortqualität (ersetzt ein vom Nutzer nicht
+    gewähltes Modell).
+  - **Frontend:** `streamMessage`-Handler `onStatus`; dezente Notiz über der
+    Eingabe nur bei echtem Reroute („PII erkannt — an EU-Modell (X)
+    geleitet") bzw. Degraded („PII-Prüfung nicht verfügbar — vorsorglich an
+    EU-Modell"). Schon-sovereign+PII → keine Notiz.
+  - **Presidio-Container:** `docker/presidio/` (FROM `mcr.microsoft.com/
+    presidio-analyzer` + `de_core_news_md` + `nlp.yaml`, `NLP_CONF_FILE`),
+    docker-compose-Service `presidio` (5002→3000). `.env.example`:
+    `PRESIDIO_URL`.
+  - **Stub (`conftest.stub_pii`, autouse, default CLEAN):** patcht
+    `app.pii.contains_pii`; `state.force ∈ {None,clean,detected,unavailable}`,
+    `state.needle` (Substring-Treffer → testet Scan des vollen Inputs).
+    Default clean → die 70 Vor-Tests unverändert grün.
+  - Verifikation: `pytest -q` **84 grün** (70→84: +5 lokale-Regex-Units in
+    test_pii.py, +9 Routing/Invarianten in test_pii_routing.py inkl.
+    Invarianten 1–3, 503, schon-sovereign, Strict=Sovereign, Cost-effektiv).
+    Erster Lauf grün, keine Diagnose nötig. `npm run build` grün (10 Routen).
+  - Live-Smoke (durch User): echter PII-Prompt (IBAN) mit chosen=gpt-5.5 →
+    Beweis effektiver Call = Mistral (`effective_model` + `messages.model` +
+    `audit.routed_to`); Gegenprobe clean → bleibt gpt-5.5. `scripts/
+    diag_routing.py` bestätigt direkten Mistral-Call.
+  - Scope: kein Strict (4.5b), keine Antwort-PII-Prüfung, keine Admin-UI,
+    kein PII-Löschkonzept, kein Fallback/Retry (4.6).
+
 - 2026-06-11: Task 4.4 abgeschlossen. Streaming (SSE) mit erhaltener
   Compliance-Garantie (decyra-api + decyra-web).
   - **Kern-Hebel:** `litellm.stream_chunk_builder(chunks, messages=…)`

@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from typing import Callable, ContextManager
@@ -11,13 +12,15 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
-from app import chat, invitations, mail
+from app import chat, invitations, mail, pii
 from app.audit import verify_workspace_chain
 from app.auth import AuthenticatedUser, get_current_user
 from app.config import Settings, get_settings
 from app.llm import configure_litellm
 from app.onboarding import ensure_workspace
 from app.verify_token import decode_verify_token
+
+logger = logging.getLogger("decyra.chat")
 
 
 @asynccontextmanager
@@ -275,6 +278,48 @@ class ChatCompletionRequest(BaseModel):
     conversation_id: str | None = None  # Decyra extension
 
 
+def _pii_mode(db: Connection, workspace_id: str) -> str:
+    """workspaces.settings->>'pii_mode' with read-validation: anything
+    unknown/missing defaults to 'sovereign' (secure default, also covers
+    existing workspaces whose settings is '{}')."""
+    row = db.execute(
+        text("SELECT settings->>'pii_mode' AS m FROM workspaces WHERE id = :w"),
+        {"w": workspace_id},
+    ).one_or_none()
+    mode = row.m if row is not None else None
+    return mode if mode in ("sovereign", "strict") else "sovereign"
+
+
+def _resolve_effective_model(
+    db: Connection,
+    *,
+    chosen_model: str,
+    chosen_row,
+    outcome: pii.PiiOutcome,
+    settings: Settings,
+):
+    """Reroute decision (Task 4.5a). Returns (effective_model, effective_row).
+    Reroute only when protection is needed AND the chosen model is not itself
+    sovereign-eligible. If no sovereign target is enabled -> 503 (never fall
+    back to a non-sovereign model)."""
+    if not outcome.needs_protection or chosen_row.sovereign_eligible:
+        return chosen_model, chosen_row
+    target = db.execute(
+        text(
+            "SELECT provider, cost_input, cost_output, eu_hosted, "
+            "sovereign_eligible FROM models "
+            "WHERE name = :m AND enabled = true AND sovereign_eligible = true"
+        ),
+        {"m": settings.sovereign_model},
+    ).one_or_none()
+    if target is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="no sovereign EU model available for PII routing",
+        )
+    return settings.sovereign_model, target
+
+
 def _stream_turn(
     *,
     kwargs: dict,
@@ -288,6 +333,8 @@ def _stream_turn(
     provider: str,
     cost_input: float,
     cost_output: float,
+    pii_detected: bool,
+    status_block: dict,
 ) -> Iterator[str]:
     """Stream provider chunks to the client AND collect them; after the
     stream, persist+audit the assembled answer in ONE short transaction
@@ -318,8 +365,12 @@ def _stream_turn(
                 provider=provider,
                 cost_input=cost_input,
                 cost_output=cost_output,
+                pii_detected=pii_detected,
             )
 
+    # First event: the PII/routing status (decision is known pre-stream), so
+    # the client can show the notice before any token arrives.
+    yield chat.sse_status(status_block)
     try:
         stream = litellm.completion(
             **kwargs, stream=True, stream_options={"include_usage": True}
@@ -345,6 +396,7 @@ def chat_completions(
     user: AuthenticatedUser = Depends(get_current_user),
     db_read: Connection = Depends(get_db),
     open_txn: Callable[[], ContextManager[Connection]] = Depends(get_write_txn),
+    settings: Settings = Depends(get_settings),
 ):
     """OpenAI-compatible chat proxy. EVERY call (streaming or not) persists
     the turn and writes an audit event — no path chats without auditing.
@@ -364,7 +416,8 @@ def chat_completions(
 
     model_row = db_read.execute(
         text(
-            "SELECT provider, cost_input, cost_output FROM models "
+            "SELECT provider, cost_input, cost_output, eu_hosted, "
+            "sovereign_eligible FROM models "
             "WHERE name = :m AND enabled = true"
         ),
         {"m": payload.model},
@@ -401,13 +454,46 @@ def chat_completions(
     else:
         llm_input = new_messages
 
-    kwargs: dict = {"model": payload.model, "messages": llm_input}
+    # --- PII check on the FULL llm_input (history + new) — Invariant 1 ---
+    # Runs in both sovereign and strict modes (in 4.5a strict behaves like
+    # sovereign). Scanning the whole input gives the one-way ratchet for
+    # free AND is necessary: history is re-sent, so a later "clean" turn
+    # must not leak earlier PII to a non-sovereign model.
+    _mode = _pii_mode(db_read, ws)  # noqa: F841 — both modes protect in 4.5a
+    full_text = "\n".join(m["content"] for m in llm_input if m.get("content"))
+    outcome = pii.contains_pii(full_text, settings)
+    effective_model, eff_row = _resolve_effective_model(
+        db_read,
+        chosen_model=payload.model,
+        chosen_row=model_row,
+        outcome=outcome,
+        settings=settings,
+    )
+    if effective_model != payload.model:
+        if outcome.status == "unavailable":
+            logger.warning(
+                "PII check unavailable — fail-safe reroute %s -> %s (ws=%s)",
+                payload.model, effective_model, ws,
+            )
+        else:
+            logger.info(
+                "PII detected — reroute %s -> %s (ws=%s)",
+                payload.model, effective_model, ws,
+            )
+    status_block = chat.pii_status(
+        pii_detected=outcome.detected,
+        pii_check=outcome.status,
+        routed_to=eff_row.provider,
+        effective_model=effective_model,
+    )
+
+    kwargs: dict = {"model": effective_model, "messages": llm_input}
     if payload.temperature is not None:
         kwargs["temperature"] = payload.temperature
     if payload.max_tokens is not None:
         kwargs["max_tokens"] = payload.max_tokens
 
-    # --- Streaming path (Task 4.4) -------------------------------------
+    # --- Streaming path (Task 4.4 + 4.5a) ------------------------------
     if payload.stream:
         return StreamingResponse(
             _stream_turn(
@@ -418,22 +504,24 @@ def chat_completions(
                 existing_cid=existing_cid,
                 new_messages=new_messages,
                 llm_input=llm_input,
-                model=payload.model,
-                provider=model_row.provider,
-                cost_input=model_row.cost_input,
-                cost_output=model_row.cost_output,
+                model=effective_model,
+                provider=eff_row.provider,
+                cost_input=eff_row.cost_input,
+                cost_output=eff_row.cost_output,
+                pii_detected=outcome.detected,
+                status_block=status_block,
             ),
             media_type="text/event-stream",
         )
 
-    # --- Non-streaming path (4.3 write block, verbatim) ----------------
+    # --- Non-streaming path (4.3 write block; effective model) ---------
     resp = litellm.completion(**kwargs)
     assistant_content = resp.choices[0].message.content or ""
     cost = chat.compute_cost(
         resp.usage.prompt_tokens,
         resp.usage.completion_tokens,
-        model_row.cost_input,
-        model_row.cost_output,
+        eff_row.cost_input,
+        eff_row.cost_output,
     )
 
     # messages.workspace_id is always ws (the conversation's workspace),
@@ -455,7 +543,7 @@ def chat_completions(
             ws,
             "assistant",
             assistant_content,
-            model=payload.model,
+            model=effective_model,
             prompt_tokens=resp.usage.prompt_tokens,
             completion_tokens=resp.usage.completion_tokens,
             cost=cost,
@@ -465,12 +553,15 @@ def chat_completions(
             db_write,
             ws,
             user.user_id,
-            payload.model,
+            effective_model,
             chat.audit_request_text(new_messages),
             assistant_content,
-            model_row.provider,
+            eff_row.provider,
+            outcome.detected,
         )
-    return chat.build_openai_response(resp, payload.model, cid)
+    return chat.build_openai_response(
+        resp, effective_model, cid, status_block
+    )
 
 
 @app.get("/conversations")

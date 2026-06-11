@@ -28,5 +28,18 @@ services:
       - "8025:8025"
     restart: unless-stopped
 
+  # Microsoft Presidio analyzer (Task 4.5a). Custom image: the stock
+  # presidio-analyzer ships English only; ours adds the German spaCy model
+  # so PERSON/LOCATION NER works for German text. REST POST /analyze on
+  # :3000, mapped to :5002 (PRESIDIO_URL). Standard global recognizers
+  # (EMAIL/IBAN/CREDIT_CARD) are language-agnostic; German Steuer-ID /
+  # Kundennummer are handled locally in app/pii.py (Presidio lacks them).
+  presidio:
+    build: ./docker/presidio
+    container_name: decyra-presidio
+    ports:
+      - "5002:3000"
+    restart: unless-stopped
+
 volumes:
   decyra_pgdata:

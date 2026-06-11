@@ -35,6 +35,18 @@ class Settings(BaseSettings):
     mistral_api_key: str | None = None
     google_api_key: str | None = None
 
+    # PII detection + sovereign routing (Task 4.5a). presidio_url unset ->
+    # the check is "unavailable" and the sovereign mode fail-safe reroutes.
+    presidio_url: str | None = None
+    # Score threshold for Presidio entities. Deliberately below Presidio's
+    # 0.5 default: in sovereign mode a false positive only over-routes to
+    # the EU (safe), a false negative leaks — so we bias toward detection.
+    pii_score_threshold: float = 0.4
+    # The sovereign reroute target. Validated at use (enabled +
+    # sovereign_eligible). Large for answer-quality parity with the cloud
+    # model the user originally picked.
+    sovereign_model: str = "mistral/mistral-large-latest"
+
 
 @lru_cache
 def get_settings() -> Settings:

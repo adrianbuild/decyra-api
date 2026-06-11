@@ -192,16 +192,27 @@
 - Bewusste Lücke (dokumentiert): Teil- vs Vollantwort in der Kette nicht unterscheidbar (kein Marker-Feld); `completed`-Flag = Kandidat für spätere Audit-Härtung, neben `resp.model`-Mitloggen.
 
 ### Task 4.5 — PII-Detection & Sovereign-Routing
-- [ ] Microsoft Presidio als Docker-Service starten
-- [ ] Backend-Anbindung an Presidio
-- [ ] Erkennung: Email, Person, Telefon, IBAN, Steuer-ID
-- [ ] Custom-Recognizer: deutsche Kundennummern (Regex)
-- [ ] Modus Strict: PII anonymisieren → Cloud-Modell → De-Anonymisierung der Antwort
-- [ ] Modus Sovereign: bei PII automatisch auf Mistral umleiten
-- [ ] Workspace-Setting steuert Strict vs. Sovereign
-- [ ] Status im Response: pii_detected, routed_to, anonymized
-- [ ] Test: Prompt mit IBAN wird korrekt umgeleitet/anonymisiert
-- **DoD:** sensibler Prompt nie ungeschützt an Cloud-Modell
+> In a/b gesplittet: 4.5a = Erkennung + Sovereign-Modus (fertig). 4.5b =
+> Strict-Modus (anonymisieren → Cloud → de-anonymisieren), später.
+
+#### Task 4.5a — PII-Erkennung + Sovereign-Routing ✅ (2026-06-11)
+- [x] Microsoft Presidio als Docker-Service (eigenes Image mit deutschem spaCy-Modell `de_core_news_md`, `docker/presidio/`, Port 5002→3000)
+- [x] Backend-Anbindung an Presidio (`app/pii.py`, httpx → `/analyze`, fail-safe bei Ausfall)
+- [x] Erkennung: Email, Person, Telefon, IBAN (Presidio, sprach-agnostische Regex + de-NER), Steuer-ID (lokal, Mod-11-Prüfziffer)
+- [x] Custom-Recognizer: deutsche Kundennummern (lokal, keyword-verankerte Regex)
+- [x] Modus Sovereign: bei PII automatisch auf `sovereign_eligible`-Modell (Mistral) umleiten, egal welches Modell gewählt; gewähltes Modell schon sovereign → kein Reroute; kein Ziel enabled → 503
+- [x] Workspace-Setting `pii_mode` in `workspaces.settings` (jsonb), Lese-Validierung → Default `sovereign`
+- [x] Status im Response/Stream: `pii_detected, pii_check, routed_to, effective_model, anonymized(=false)` (Stream: erstes Event)
+- [x] Frontend: dezente Notiz bei Reroute / Degraded
+- [x] Tests: Reroute (stream+non-stream), Invariante 1 (Historie-Ratsche), Invariante 2 (Presidio-Ausfall fail-safe), Invariante 3 (Compliance/Kette), 503, schon-sovereign, Strict=Sovereign in 4.5a, Cost effektiv, lokale Regex
+- **DoD:** sensibler Prompt nie ungeschützt an Nicht-Sovereign-Modell ✅ (84 Tests grün, `npm build` grün; Live-Smoke durch User)
+- **Audit:** `request_text` bleibt Original; `pii_detected=true` nur bei echter Erkennung (Degraded-Reroute → false + `pii_check=unavailable`, via Log/Response sichtbar). `model`/`routed_to`/`cost` = EFFEKTIVES Modell.
+- Bewusste Lücken (Security-Block): Erkennung statistisch (Falsch-Negative real); DSGVO-Spannungsfeld (PII in unlöschbarer Kette); Degraded-Reroute im Audit nicht vom Clean-Fall unterscheidbar; `de`-only-Scan.
+
+#### Task 4.5b — Strict-Modus (später)
+- [ ] PII anonymisieren → Cloud-Modell → De-Anonymisierung der Antwort
+- [ ] `anonymized`-Flag echt setzen; Admin-UI fürs `pii_mode`-Setting
+- (in 4.5a verhält sich `strict` wie `sovereign`: Reroute statt Anonymisierung)
 
 ### Task 4.6 — Fehlerbehandlung & Fallback
 - [ ] Provider-Timeout/Fehler abfangen, sauberer Error ans Frontend
