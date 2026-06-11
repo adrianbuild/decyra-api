@@ -181,13 +181,15 @@
 - **DoD:** Chat-Request läuft, wird geloggt + auditiert + verifizierbar, Kosten erfasst ✅ (60 Tests grün, LLM gestubbt)
 - Hinweis: echte LLM-Antworten = 4.1 Phase B (Keys), Frontend = 4.2.
 
-### Task 4.4 — Streaming (eigener Task — kniffliger Teil)
-- [ ] Server-Sent-Events / Streaming-Response vom Provider durchreichen
-- [ ] Stream-Chunks an Frontend weitergeben (flüssige Anzeige)
-- [ ] Audit-Logging NACH Stream-Ende (vollständige Antwort sammeln)
-- [ ] PII-Hinweis vor Stream-Start (siehe 4.5) berücksichtigen
-- [ ] Test: langer Output streamt flüssig, wird vollständig geloggt
-- **DoD:** Streaming funktioniert end-to-end inkl. korrektem Audit
+### Task 4.4 — Streaming ✅ (2026-06-11)
+- [x] Server-Sent-Events / Streaming-Response vom Provider durchreichen (StreamingResponse + litellm stream=True, OpenAI-SSE `data: {chunk}` … `[DONE]`)
+- [x] Stream-Chunks an Frontend weitergeben (flüssige Anzeige) (api.ts `streamMessage` getReader/TextDecoder, chat-client live wachsende Blase)
+- [x] Audit-Logging NACH Stream-Ende (vollständige Antwort sammeln) (`stream_chunk_builder` rekonstruiert ModelResponse+usage → 4.3-Write-Block wiederverwendet; Compliance-Garantie geerbt)
+- [ ] PII-Hinweis vor Stream-Start (siehe 4.5) berücksichtigen → bewusst nach 4.5 verschoben (PII existiert noch nicht)
+- [x] Test: langer Output streamt flüssig, wird vollständig geloggt (Kette unter Streaming verifiziert; + Abbruch-Fälle: Provider-Abort persistiert Teilantwort, Null-Content persistiert nichts)
+- **DoD:** Streaming funktioniert end-to-end inkl. korrektem Audit ✅ (70 Tests grün, `npm run build` grün; manueller Browser-Test durch User)
+- Test-injizierbarer Write-Transaction-Opener (`get_write_txn`-Factory) statt yield-Dependency, damit die kurze Audit-Transaktion NACH dem Stream öffnet (Advisory-Lock ms-kurz). non-streaming-Pfad (4.3) verhaltensgleich.
+- Bewusste Lücke (dokumentiert): Teil- vs Vollantwort in der Kette nicht unterscheidbar (kein Marker-Feld); `completed`-Flag = Kandidat für spätere Audit-Härtung, neben `resp.model`-Mitloggen.
 
 ### Task 4.5 — PII-Detection & Sovereign-Routing
 - [ ] Microsoft Presidio als Docker-Service starten

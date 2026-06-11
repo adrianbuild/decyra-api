@@ -1,10 +1,12 @@
 from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
+from typing import Callable, ContextManager
 from uuid import UUID
 
 import litellm
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
@@ -80,6 +82,34 @@ def get_db_write(
         _engine = create_engine(settings.database_url, future=True)
     with _engine.begin() as conn:
         yield conn
+
+
+def get_write_txn(
+    settings: Settings = Depends(get_settings),
+) -> Callable[[], ContextManager[Connection]]:
+    """Return a FACTORY that opens a short write transaction on demand —
+    not a yield-dependency. A StreamingResponse finalises yield-deps only
+    after the whole body is sent; using ``get_db_write`` would hold the
+    transaction (and idle the connection) across the entire stream. The
+    factory lets the streaming generator open the transaction AFTER the
+    last chunk, so the hash-chain advisory lock is held for milliseconds.
+
+    The non-streaming chat path uses the same factory (one mechanism). In
+    tests this dependency is overridden to yield the per-test Connection,
+    so the streaming write never opens its own ``engine.begin()`` and the
+    fixture rollback keeps isolation. ``onboarding`` still uses
+    ``get_db_write`` unchanged.
+    """
+
+    @contextmanager
+    def _open() -> Iterator[Connection]:
+        global _engine
+        if _engine is None:
+            _engine = create_engine(settings.database_url, future=True)
+        with _engine.begin() as conn:
+            yield conn
+
+    return _open
 
 
 def set_workspace_context(db: Connection, workspace_id: object) -> None:
@@ -245,27 +275,86 @@ class ChatCompletionRequest(BaseModel):
     conversation_id: str | None = None  # Decyra extension
 
 
+def _stream_turn(
+    *,
+    kwargs: dict,
+    open_txn: Callable[[], ContextManager[Connection]],
+    ws: str,
+    user_id: str,
+    existing_cid: str | None,
+    new_messages: list[dict],
+    llm_input: list[dict],
+    model: str,
+    provider: str,
+    cost_input: float,
+    cost_output: float,
+) -> Iterator[str]:
+    """Stream provider chunks to the client AND collect them; after the
+    stream, persist+audit the assembled answer in ONE short transaction
+    (the 4.3 write block, reused via ``chat.persist_stream_turn``). Three
+    exit paths share the same persist:
+
+    - client abort (GeneratorExit): persist the collected partial, no yield
+      (yielding during GeneratorExit is illegal), then re-raise.
+    - provider abort (Exception): the partial was SEEN by the user, so it is
+      persisted+audited; the client gets an ``error`` event (no [DONE]).
+    - clean finish (else): persist the full answer, then the final chunk
+      (carrying the authoritative conversation_id) + [DONE].
+    """
+    collected: list = []
+
+    def _persist() -> str | None:
+        with open_txn() as db_write:
+            set_workspace_context(db_write, ws)
+            return chat.persist_stream_turn(
+                db_write,
+                ws,
+                user_id,
+                existing_cid,
+                new_messages,
+                collected,
+                llm_input,
+                model=model,
+                provider=provider,
+                cost_input=cost_input,
+                cost_output=cost_output,
+            )
+
+    try:
+        stream = litellm.completion(
+            **kwargs, stream=True, stream_options={"include_usage": True}
+        )
+        for chunk in stream:
+            collected.append(chunk)
+            yield chat.sse_chunk(chunk, existing_cid)
+    except GeneratorExit:
+        _persist()
+        raise
+    except Exception as e:
+        cid = _persist()
+        yield chat.sse_error(str(e), cid or existing_cid)
+        return
+    cid = _persist()
+    yield chat.sse_final(cid or existing_cid, model)
+    yield chat.sse_done()
+
+
 @app.post("/v1/chat/completions")
 def chat_completions(
     payload: ChatCompletionRequest,
     user: AuthenticatedUser = Depends(get_current_user),
     db_read: Connection = Depends(get_db),
-    db_write: Connection = Depends(get_db_write),
-) -> dict:
-    """OpenAI-compatible chat proxy (non-streaming). EVERY call persists
+    open_txn: Callable[[], ContextManager[Connection]] = Depends(get_write_txn),
+):
+    """OpenAI-compatible chat proxy. EVERY call (streaming or not) persists
     the turn and writes an audit event — no path chats without auditing.
 
-    Two DB connections: db_read for history/ownership, db_write for the
-    persist. The LLM call happens between them, while db_write is still
-    idle (no statements, no locks) — the hash-chain advisory lock is only
-    taken at the final audit INSERT.
+    Shared validation runs on db_read FIRST, so 403/400/404 are real HTTP
+    statuses returned before any stream begins. Then: stream=true -> SSE
+    StreamingResponse; otherwise the non-streaming 4.3 path. Both open a
+    SHORT write transaction via ``open_txn()`` so the hash-chain advisory
+    lock is held only for the persist (never across the stream).
     """
-    if payload.stream:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="streaming is not supported here (see Task 4.4)",
-        )
-
     member = invitations.resolve_membership(db_read, user.user_id)
     if member is None:
         raise HTTPException(
@@ -293,6 +382,7 @@ def chat_completions(
     # History + ownership (Decyra mode). conversation_id wins over the
     # messages array: stored history is always prepended.
     set_workspace_context(db_read, ws)
+    existing_cid: str | None = None
     if payload.conversation_id:
         try:
             UUID(payload.conversation_id)
@@ -306,16 +396,37 @@ def chat_completions(
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, detail="conversation not found"
             )
+        existing_cid = payload.conversation_id
         llm_input = chat.load_history(db_read, payload.conversation_id) + new_messages
     else:
         llm_input = new_messages
 
-    # LLM call — db_write still idle.
     kwargs: dict = {"model": payload.model, "messages": llm_input}
     if payload.temperature is not None:
         kwargs["temperature"] = payload.temperature
     if payload.max_tokens is not None:
         kwargs["max_tokens"] = payload.max_tokens
+
+    # --- Streaming path (Task 4.4) -------------------------------------
+    if payload.stream:
+        return StreamingResponse(
+            _stream_turn(
+                kwargs=kwargs,
+                open_txn=open_txn,
+                ws=ws,
+                user_id=user.user_id,
+                existing_cid=existing_cid,
+                new_messages=new_messages,
+                llm_input=llm_input,
+                model=payload.model,
+                provider=model_row.provider,
+                cost_input=model_row.cost_input,
+                cost_output=model_row.cost_output,
+            ),
+            media_type="text/event-stream",
+        )
+
+    # --- Non-streaming path (4.3 write block, verbatim) ----------------
     resp = litellm.completion(**kwargs)
     assistant_content = resp.choices[0].message.content or ""
     cost = chat.compute_cost(
@@ -325,38 +436,40 @@ def chat_completions(
         model_row.cost_output,
     )
 
-    # WRITE block (first statements on db_write). messages.workspace_id is
-    # always ws (the conversation's workspace), never request-derived.
-    set_workspace_context(db_write, ws)
-    if payload.conversation_id:
-        cid = payload.conversation_id
-    else:
-        cid = chat.create_conversation(
-            db_write, ws, user.user_id, chat.derive_title(new_messages)
+    # messages.workspace_id is always ws (the conversation's workspace),
+    # never request-derived. Short transaction via the same factory the
+    # streaming path uses.
+    with open_txn() as db_write:
+        set_workspace_context(db_write, ws)
+        if payload.conversation_id:
+            cid = payload.conversation_id
+        else:
+            cid = chat.create_conversation(
+                db_write, ws, user.user_id, chat.derive_title(new_messages)
+            )
+        for m in chat.persistable_messages(new_messages):
+            chat.insert_message(db_write, cid, ws, m["role"], m["content"])
+        chat.insert_message(
+            db_write,
+            cid,
+            ws,
+            "assistant",
+            assistant_content,
+            model=payload.model,
+            prompt_tokens=resp.usage.prompt_tokens,
+            completion_tokens=resp.usage.completion_tokens,
+            cost=cost,
         )
-    for m in chat.persistable_messages(new_messages):
-        chat.insert_message(db_write, cid, ws, m["role"], m["content"])
-    chat.insert_message(
-        db_write,
-        cid,
-        ws,
-        "assistant",
-        assistant_content,
-        model=payload.model,
-        prompt_tokens=resp.usage.prompt_tokens,
-        completion_tokens=resp.usage.completion_tokens,
-        cost=cost,
-    )
-    chat.touch_conversation(db_write, cid)
-    chat.insert_audit_event(
-        db_write,
-        ws,
-        user.user_id,
-        payload.model,
-        chat.audit_request_text(new_messages),
-        assistant_content,
-        model_row.provider,
-    )
+        chat.touch_conversation(db_write, cid)
+        chat.insert_audit_event(
+            db_write,
+            ws,
+            user.user_id,
+            payload.model,
+            chat.audit_request_text(new_messages),
+            assistant_content,
+            model_row.provider,
+        )
     return chat.build_openai_response(resp, payload.model, cid)
 
 

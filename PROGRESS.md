@@ -3,14 +3,14 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 4 — Routing/Chat/PII**: 4.2 (Chat-Frontend) abgeschlossen. Offen in Block 4: 4.1 Phase B (User trägt Provider-Keys ein, `python scripts/test_providers.py` → echte LLM-Antworten im Chat), dann 4.4 (Streaming) / 4.5 (PII) / 4.6 (Fehler/Fallback).
+**Block 4 — Routing/Chat/PII**: 4.4 (Streaming) abgeschlossen. Offen in Block 4: 4.5 (PII-Routing) und 4.6 (Fehler/Fallback). 4.1 Phase B de facto erledigt (echte Anthropic/Mistral-Antworten laufen).
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
 - [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [x] 2.2c decyra_app-Switch + RLS scharf; [x] 2.3 Einladungen & Rollen; [ ] 2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
-- [~] Block 4 — Routing/Chat/PII ([~] 4.1 Phase A done, Phase B pending; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [ ] 4.4/4.5/4.6)
+- [~] Block 4 — Routing/Chat/PII ([x] 4.1 Phase A; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [x] 4.4 Streaming; [ ] 4.5/4.6)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
 - [ ] Block 5B — Chat-Features (5B.1 Datei-Upload, 5B.2 Datenanalyse+Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects)
 - [ ] Block 6 — Frontend (6.1 Chat, 6.2 Dashboard Logs, 6.3 Dashboard Verwaltung)
@@ -75,6 +75,67 @@ Die drei ursprünglichen Punkte:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-11: Task 4.4 abgeschlossen. Streaming (SSE) mit erhaltener
+  Compliance-Garantie (decyra-api + decyra-web).
+  - **Kern-Hebel:** `litellm.stream_chunk_builder(chunks, messages=…)`
+    (litellm 1.86.2, im Quelltext verifiziert: `calculate_usage` +
+    `setattr(response,"usage",…)`) rekonstruiert aus den gesammelten
+    Chunks dieselbe ModelResponse+usage wie der 4.3-Pfad → der komplette
+    4.3-Write-Block wird wiederverwendet, die Garantie wird GEERBT, nicht
+    nachgebaut.
+  - **`app/chat.py`:** `rebuild_stream_response` (None bei leeren Chunks/
+    leerem Content), `persist_stream_turn` (= 4.3-Write-Block, Quelle aus
+    Chunks; legt Conversation erst hier an → kein Orphan bei Abbruch, weil
+    decyra_app KEIN DELETE auf conversations/messages hat — live geprüft),
+    SSE-Serializer `sse_chunk/sse_final/sse_error/sse_done` (OpenAI-Chunk-
+    Form via reinen Attribut-Zugriff → echte litellm- UND Stub-Chunks).
+  - **`app/main.py`:** `get_write_txn` = Factory-Dependency (kein yield →
+    nichts wird über die Stream-Dauer gehalten; die Falle vermieden), in
+    conftest auf die Per-Test-Connection überschreibbar. `chat_completions`
+    verzweigt nach gemeinsamer Validierung: `stream=true` →
+    `StreamingResponse(_stream_turn(...))`, sonst 4.3-Block VERBATIM in
+    `with open_txn() as db_write:`. Chat-Endpoint nutzt `get_db_write`
+    nicht mehr (onboarding unverändert). Der 4.3-Stream-Guard (400) ist
+    durch den echten Pfad ersetzt.
+  - **Abbruch (`_stream_turn`, drei Einstiege, kein yield im finally):**
+    GeneratorExit (Client weg) → persist collected, re-raise; Exception
+    (Provider-Abbruch) → persist collected + `error`-Event; else → persist
+    + `sse_final(cid)` + `[DONE]`. CLIENT-Abbruch auditiert die GESAMMELTE
+    Teilantwort (Gesammeltes ⊇ Gesehenes; drain-to-completion verworfen,
+    Future-Hardening). PROVIDER-Abbruch: Teilantwort wurde gezeigt → wird
+    auditiert. Null-Content (Fehler vor 1. Chunk) → nichts persistiert,
+    kein Orphan (wie 4.3).
+  - **conversation_id-Vehikel:** im finalen Chunk (nach Persist; für neue
+    Konv. existiert die id erst dann — No-DELETE → keine Pre-Creation),
+    bestehende Konv. zusätzlich im ersten Chunk geechot.
+  - **Cost/Token:** aus `stream_chunk_builder`-usage → `compute_cost`
+    unverändert; `stream_options={"include_usage":true}` als Best-Effort.
+  - **Stub (`conftest.stub_llm`):** `completion(stream=True)` → Fake-Chunk-
+    Generator (ein Chunk/Wort); `state["raise_after"]=k` → wirft nach k
+    Chunks (k=0 = Null-Content). `stream_chunk_builder` gestubbt
+    (rekonstruiert Content aus den ÜBERGEBENEN Chunks → Teil vs Voll
+    unterscheidbar). Neuer `get_write_txn`-Override (beide app-Fixtures).
+  - **Frontend:** `api.ts streamMessage` (getReader + TextDecoder, SSE
+    `data:`-Parsing, `[DONE]`/`error`/`conversation_id`/delta). `chat-
+    client send()` rendert live in eine wachsende assistant-Blase;
+    „denkt…"-Skeleton nur bis zum 1. Token; Sperr-Zustand bleibt; Stream-
+    Fehler via Toast+Inline. non-streaming `sendMessage` bleibt als
+    Fallback exportiert.
+  - DEBUG (Diagnose vor Fix): 1 roter Test war `test_chat_stream_rejected`
+    (assertierte den 4.3-400-Guard) — durch 4.4 BEWUSST ersetzt, kein
+    Regressions-Bug (69/70 grün, nur dieser Guard kippte). Test auf das
+    neue Positiv-Verhalten (200 + text/event-stream) umgeschrieben
+    (`test_chat_stream_now_supported`).
+  - Verifikation: `pytest -q` **70 grün** (62→70: +8 Streaming-Tests in
+    test_chat_stream.py, davon der Compliance-Test [Kette unter Streaming
+    valid] der wichtigste; Guard-Test umfunktioniert statt neu).
+    `npm run build` grün (10 Routen, /chat 43.7 kB). LLM+Stream gestubbt.
+  - Bewusste Lücke (dokumentiert): Teil- vs Vollantwort in der Kette nicht
+    unterscheidbar (kein Marker-Feld) — `completed`-Flag = Kandidat für
+    spätere Audit-Härtung, neben `resp.model`-Mitloggen.
+  - Scope: kein PII (4.5), kein Fallback/Router (4.6), kein neues Audit-
+    Schema, non-streaming-Verhalten unverändert.
+
 - 2026-06-04: Task 4.2 abgeschlossen. Chat-Frontend mit Konversations-
   Verwaltung (decyra-web) + EIN Backend-Touch (`GET /models`).
   - **Backend (decyra-api):** `GET /models` in `app/main.py` — JWT via

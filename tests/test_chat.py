@@ -181,7 +181,10 @@ async def test_chat_unknown_and_disabled_model_rejected(
 
 
 @pytest.mark.asyncio
-async def test_chat_stream_rejected(client, db, make_token) -> None:
+async def test_chat_stream_now_supported(client, db, make_token) -> None:
+    """Task 4.4 replaced the 4.3 stream=400 guard with the real streaming
+    path: stream=true now returns an OpenAI-compatible SSE stream.
+    (Full streaming behaviour is covered in test_chat_stream.py.)"""
     seed_org_with_owner(db, USER_A, "a@firma.de")
     _seed_model(db)
     token = make_token(sub=USER_A, email="a@firma.de")
@@ -194,7 +197,9 @@ async def test_chat_stream_rejected(client, db, make_token) -> None:
             "messages": [{"role": "user", "content": "x"}],
         },
     )
-    assert r.status_code == 400
+    assert r.status_code == 200
+    assert "text/event-stream" in r.headers["content-type"]
+    assert "data: [DONE]" in r.text
 
 
 @pytest.mark.asyncio

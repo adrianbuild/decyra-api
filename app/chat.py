@@ -14,6 +14,10 @@ Invariants:
 
 from __future__ import annotations
 
+import json
+import time
+
+import litellm
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
@@ -198,3 +202,156 @@ def insert_audit_event(
 
 def persistable_messages(messages: list[dict]) -> list[dict]:
     return [m for m in messages if m.get("role") in _PERSISTABLE_ROLES]
+
+
+# --- Streaming (Task 4.4) ----------------------------------------------
+#
+# The streaming path collects the provider chunks, then rebuilds the SAME
+# ModelResponse shape the non-streaming path uses (content + usage) via
+# litellm.stream_chunk_builder, so the entire persist+audit block is
+# reused — the 4.3 compliance guarantee is inherited, not rebuilt.
+
+
+def rebuild_stream_response(
+    chunks: list, llm_input: list[dict]
+) -> tuple[str, int, int] | None:
+    """Reconstruct (content, prompt_tokens, completion_tokens) from the
+    collected streaming chunks. Returns None when nothing usable was
+    collected (no chunks, or empty content) — the caller then persists
+    nothing (matches 4.3, where a provider error before the write block
+    writes nothing). Token counts come from litellm's calculate_usage
+    (tokenizer-based when the provider omits them in the stream)."""
+    if not chunks:
+        return None
+    resp = litellm.stream_chunk_builder(chunks, messages=llm_input)
+    if resp is None:
+        return None
+    content = resp.choices[0].message.content or ""
+    if not content:
+        return None
+    usage = resp.usage
+    return content, usage.prompt_tokens, usage.completion_tokens
+
+
+def persist_stream_turn(
+    db_write: Connection,
+    workspace_id: str,
+    user_id: str,
+    existing_cid: str | None,
+    new_messages: list[dict],
+    chunks: list,
+    llm_input: list[dict],
+    *,
+    model: str,
+    provider: str,
+    cost_input: float,
+    cost_output: float,
+) -> str | None:
+    """Persist a streamed turn + write the audit event — byte-for-byte the
+    same write block as the 4.3 non-streaming path, only sourcing the
+    assistant content/usage from the collected chunks. Creates the
+    conversation when ``existing_cid`` is None (so an aborted turn that
+    produced nothing leaves NO orphan — decyra_app cannot DELETE
+    conversations). Returns the conversation id, or None if nothing was
+    collected (skip).
+
+    The caller must have set the workspace RLS context on ``db_write``
+    before calling (same as the 4.3 block)."""
+    rebuilt = rebuild_stream_response(chunks, llm_input)
+    if rebuilt is None:
+        return None
+    assistant_content, prompt_tokens, completion_tokens = rebuilt
+    cost = compute_cost(prompt_tokens, completion_tokens, cost_input, cost_output)
+
+    cid = existing_cid or create_conversation(
+        db_write, workspace_id, user_id, derive_title(new_messages)
+    )
+    for m in persistable_messages(new_messages):
+        insert_message(db_write, cid, workspace_id, m["role"], m["content"])
+    insert_message(
+        db_write,
+        cid,
+        workspace_id,
+        "assistant",
+        assistant_content,
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cost=cost,
+    )
+    touch_conversation(db_write, cid)
+    insert_audit_event(
+        db_write,
+        workspace_id,
+        user_id,
+        model,
+        audit_request_text(new_messages),
+        assistant_content,
+        provider,
+    )
+    return cid
+
+
+# --- OpenAI-compatible SSE serialisation --------------------------------
+
+
+def _chunk_dict(chunk, conversation_id: str | None = None) -> dict:
+    """Shape one streaming chunk as an OpenAI chat.completion.chunk. Pure
+    attribute access, so it works for real litellm chunks AND the test
+    stub's SimpleNamespace chunks. conversation_id rides as an extra
+    top-level field (OpenAI clients ignore unknown fields)."""
+    choice = chunk.choices[0]
+    delta = getattr(choice, "delta", None)
+    content = getattr(delta, "content", None) if delta is not None else None
+    role = getattr(delta, "role", None) if delta is not None else None
+    out_delta: dict = {}
+    if role is not None:
+        out_delta["role"] = role
+    if content is not None:
+        out_delta["content"] = content
+    d: dict = {
+        "id": getattr(chunk, "id", None),
+        "object": "chat.completion.chunk",
+        "created": getattr(chunk, "created", None),
+        "model": getattr(chunk, "model", None),
+        "choices": [
+            {
+                "index": getattr(choice, "index", 0),
+                "delta": out_delta,
+                "finish_reason": getattr(choice, "finish_reason", None),
+            }
+        ],
+    }
+    if conversation_id is not None:
+        d["conversation_id"] = conversation_id
+    return d
+
+
+def sse_chunk(chunk, conversation_id: str | None = None) -> str:
+    return f"data: {json.dumps(_chunk_dict(chunk, conversation_id))}\n\n"
+
+
+def sse_final(conversation_id: str | None, model: str) -> str:
+    """Terminal chunk: empty delta + finish_reason stop, carrying the
+    authoritative conversation_id (the only place a NEW conversation's id
+    is known — it is created during persist, after the provider stream)."""
+    d = {
+        "id": "chatcmpl-decyra",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "conversation_id": conversation_id,
+    }
+    return f"data: {json.dumps(d)}\n\n"
+
+
+def sse_error(message: str, conversation_id: str | None = None) -> str:
+    d: dict = {"error": {"message": message, "type": "stream_error"}}
+    if conversation_id is not None:
+        d["conversation_id"] = conversation_id
+    return f"data: {json.dumps(d)}\n\n"
+
+
+def sse_done() -> str:
+    return "data: [DONE]\n\n"

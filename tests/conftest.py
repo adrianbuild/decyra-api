@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
 
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
@@ -62,7 +63,7 @@ from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.engine import Connection, Engine  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
-from app.main import app, get_db, get_db_write  # noqa: E402
+from app.main import app, get_db, get_db_write, get_write_txn  # noqa: E402
 
 TEST_ISSUER = f"{get_settings().supabase_url}/auth/v1"
 
@@ -118,15 +119,28 @@ def app_with_db(db: Connection):
     def _override():
         yield db
 
+    def _override_write_txn():
+        # The streaming/non-streaming chat path opens its short write txn
+        # via this factory. Yield the per-test Connection (no engine.begin,
+        # no commit) so writes land in the test transaction and the db
+        # fixture rollback keeps isolation.
+        @contextmanager
+        def _open():
+            yield db
+
+        return _open
+
     # Both read (get_db) and write (get_db_write) endpoints share the
     # per-test Connection. The write dependency's real engine.begin()
     # never runs under test; the db fixture's transaction rolls back,
     # so onboarding writes stay isolated.
     app.dependency_overrides[get_db] = _override
     app.dependency_overrides[get_db_write] = _override
+    app.dependency_overrides[get_write_txn] = _override_write_txn
     yield app
     app.dependency_overrides.pop(get_db, None)
     app.dependency_overrides.pop(get_db_write, None)
+    app.dependency_overrides.pop(get_write_txn, None)
 
 
 @pytest_asyncio.fixture
@@ -154,11 +168,23 @@ def app_with_db_decyra_app(db: Connection):
         )
         yield db
 
+    def _override_write_txn():
+        # db_read's override already did SET LOCAL ROLE decyra_app on this
+        # same connection/transaction (role persists, SET LOCAL is txn-
+        # scoped), so the write factory just yields it.
+        @contextmanager
+        def _open():
+            yield db
+
+        return _open
+
     app.dependency_overrides[get_db] = _override
     app.dependency_overrides[get_db_write] = _override
+    app.dependency_overrides[get_write_txn] = _override_write_txn
     yield app
     app.dependency_overrides.pop(get_db, None)
     app.dependency_overrides.pop(get_db_write, None)
+    app.dependency_overrides.pop(get_write_txn, None)
 
 
 @pytest_asyncio.fixture
@@ -203,9 +229,15 @@ def _patch_jwks(monkeypatch, test_ec_private_key):  # type: ignore[no-untyped-de
 
 @pytest.fixture(autouse=True)
 def stub_llm(monkeypatch):
-    """Patch litellm.completion so pytest never makes a real API call.
-    Returns a controller: `.state` to tune the next response (tokens/
-    content), `.calls` to inspect the messages the endpoint passed."""
+    """Patch litellm.completion (and stream_chunk_builder) so pytest never
+    makes a real API call. Returns a controller: `.state` to tune the next
+    response (tokens/content, and streaming knobs `raise_after`/`error_msg`),
+    `.calls` to inspect the kwargs the endpoint passed.
+
+    Streaming: `litellm.completion(stream=True)` returns a fake generator
+    that yields one OpenAI-chunk per word of `state["content"]`. Set
+    `state["raise_after"] = k` to yield k chunks then raise (deterministic
+    provider abort; k=0 raises before any chunk → null-content abort)."""
     import types
 
     state = {
@@ -214,11 +246,12 @@ def stub_llm(monkeypatch):
         "completion_tokens": 5,
         "id": "chatcmpl-test",
         "created": 1717000000,
+        "raise_after": None,  # None = no abort; int k = raise after k chunks
+        "error_msg": "provider boom",
     }
     calls: list[dict] = []
 
-    def _completion(**kwargs):  # type: ignore[no-untyped-def]
-        calls.append(kwargs)
+    def _make_response(model):  # type: ignore[no-untyped-def]
         pt, ct = state["prompt_tokens"], state["completion_tokens"]
         message = types.SimpleNamespace(role="assistant", content=state["content"])
         choice = types.SimpleNamespace(
@@ -230,12 +263,60 @@ def stub_llm(monkeypatch):
         return types.SimpleNamespace(
             id=state["id"],
             created=state["created"],
-            model=kwargs.get("model"),
+            model=model,
             choices=[choice],
             usage=usage,
         )
 
+    def _stream_chunks(model):  # type: ignore[no-untyped-def]
+        tokens = state["content"].split(" ")
+        for i, tok in enumerate(tokens):
+            if state["raise_after"] is not None and i >= state["raise_after"]:
+                raise RuntimeError(state["error_msg"])
+            piece = tok if i == 0 else " " + tok
+            delta = types.SimpleNamespace(
+                role=("assistant" if i == 0 else None), content=piece
+            )
+            choice = types.SimpleNamespace(index=0, delta=delta, finish_reason=None)
+            yield types.SimpleNamespace(
+                id=state["id"], created=state["created"], model=model,
+                choices=[choice],
+            )
+        # Terminal finish chunk (no content).
+        delta = types.SimpleNamespace(role=None, content=None)
+        choice = types.SimpleNamespace(index=0, delta=delta, finish_reason="stop")
+        yield types.SimpleNamespace(
+            id=state["id"], created=state["created"], model=model,
+            choices=[choice],
+        )
+
+    def _completion(**kwargs):  # type: ignore[no-untyped-def]
+        calls.append(kwargs)
+        if kwargs.get("stream"):
+            return _stream_chunks(kwargs.get("model"))
+        return _make_response(kwargs.get("model"))
+
+    def _chunk_builder(chunks, messages=None, **kw):  # type: ignore[no-untyped-def]
+        # Reconstruct content from the GIVEN chunks (so partial vs full
+        # differ); usage from state. Mirrors litellm.stream_chunk_builder.
+        content = "".join(
+            (c.choices[0].delta.content or "") for c in chunks
+        )
+        pt, ct = state["prompt_tokens"], state["completion_tokens"]
+        message = types.SimpleNamespace(role="assistant", content=content)
+        choice = types.SimpleNamespace(
+            index=0, message=message, finish_reason="stop"
+        )
+        usage = types.SimpleNamespace(
+            prompt_tokens=pt, completion_tokens=ct, total_tokens=pt + ct
+        )
+        return types.SimpleNamespace(
+            id=state["id"], created=state["created"], model=None,
+            choices=[choice], usage=usage,
+        )
+
     monkeypatch.setattr("litellm.completion", _completion)
+    monkeypatch.setattr("litellm.stream_chunk_builder", _chunk_builder)
     return types.SimpleNamespace(state=state, calls=calls)
 
 
