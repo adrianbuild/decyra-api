@@ -1,0 +1,36 @@
+# Presidio recognizer-registry configuration — German (Task 4.5a fix).
+#
+# ROOT CAUSE this fixes: configuring only the NLP engine for "de" (nlp.yaml)
+# left the registry at its default supported language "en", so the global
+# pattern recognizers (IbanRecognizer, EmailRecognizer, …) registered for "en"
+# only. A language=de request then ran ONLY the spaCy NER recognizer →
+# IBAN/Email/Phone silently undetected. Pointed to by RECOGNIZER_REGISTRY_CONF_FILE.
+#
+# The global recognizers below have NO per-recognizer supported_languages, so
+# they inherit the top-level list — here [de]. That is exactly what binds them
+# to German requests. (The NLP/Spacy recognizer for PERSON/LOCATION is added
+# automatically from the NLP engine; it is not listed here.)
+supported_languages:
+  - de
+global_regex_flags: 26
+
+recognizers:
+  - name: EmailRecognizer
+    type: predefined
+  - name: IbanRecognizer
+    type: predefined
+  - name: PhoneRecognizer
+    type: predefined
+  - name: IpRecognizer
+    type: predefined
+  - name: UrlRecognizer
+    type: predefined
+  - name: CryptoRecognizer
+    type: predefined
+  # CreditCard defines its own per-language list in code, so declare "de"
+  # explicitly with German context words.
+  - name: CreditCardRecognizer
+    supported_languages:
+      - language: de
+        context: [kreditkarte, karte, visa, mastercard, amex, kreditkartennummer]
+    type: predefined

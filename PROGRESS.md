@@ -34,6 +34,15 @@
 Die drei 2.2-Punkte sind erledigt (siehe unten). NEU aus 4.5a (bewusste
 Eigenschaften, vor Pilot bewerten):
 
+- **Pflicht-Live-Smoke vor Pilot (Presidio-Config-Korrektheit).** Stub-Tests
+  können die Korrektheit der ECHTEN Recognizer-Konfiguration prinzipiell nicht
+  prüfen (`stub_pii` ist ein boolesches Orakel). Daher fester manueller Check
+  gegen den laufenden Container, `language=de`:
+  `curl -s -XPOST localhost:5002/analyze -d '{"text":"IBAN DE89370400440532013000","language":"de"}'`
+  muss `IBAN_CODE` liefern; Email→`EMAIL_ADDRESS`, Telefon→`PHONE_NUMBER`.
+  Der Container-Healthcheck erzwingt `IBAN_CODE` strukturell (unhealthy sonst).
+  Lektion: diese Fehlklasse (erreichbar, aber fehl-konfiguriert) fand erst der
+  Live-Smoke, nicht pytest — bei jedem Presidio-Image-/Conf-Update neu prüfen.
 - **PII-Erkennung ist statistisch.** NER + Regex → Falsch-Negative real
   (firmenspezifische Kundennummern, unüblich formatierte PII, englische
   Namen unter dem `de`-Modell). 4.5a SENKT das Leak-Risiko, GARANTIERT keine
@@ -94,6 +103,39 @@ Die drei ursprünglichen Punkte:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-11: 4.5a-Folge-Fix — Presidio erkannte für `de` KEINE Pattern-PII
+  (IBAN/Email/Telefon), nur NER. Vom Live-Smoke gefunden, nicht von pytest.
+  - URSACHE (per Diagnose, nicht geraten): wir hatten nur die NLP-Engine auf
+    `de` (`nlp.yaml`), aber Presidio bindet die globalen Pattern-Recognizer
+    an die **supported_languages der Registry** — die stand auf Default `en`.
+    `/recognizers?language=de` lieferte nur `["SpacyRecognizer"]`; Startup-Log:
+    „Recognizer not added … registry supported languages: en". → `language=de`
+    lief nur NER, IBAN/Email/Telefon nie geprüft. (Folge: nach `.env`-Fix wäre
+    ein IBAN-Prompt still als „clean" durchgegangen — fail-safe greift nur bei
+    Nichterreichbarkeit, nicht bei Fehl-Erkennung.)
+  - FIX (deklarativ, kein Code): drei konsistente Confs ins Image —
+    `recognizers.yaml` (`RECOGNIZER_REGISTRY_CONF_FILE`, `supported_languages:
+    [de]` + globale Pattern-Recognizer ohne per-Recognizer-Sprache → erben
+    `de`), `analyzer.yaml` (`ANALYZER_CONF_FILE`, `supported_languages: [de]` —
+    sonst „supported languages have to be consistent", Worker bootet nicht),
+    `nlp.yaml` erweitert um `ner_model_configuration` (PER→PERSON, LOC→LOCATION,
+    ORG ignoriert → Email wird nicht mehr als ORGANIZATION getaggt).
+  - Verifiziert per curl (`language=de`): IBAN→`IBAN_CODE` (1.0), Email→
+    `EMAIL_ADDRESS` (1.0, kein ORGANIZATION), Telefon→`PHONE_NUMBER` (0.4 —
+    exakt am Threshold, passt knapp; deutsche Festnetz-Formate ohne +49 ggf.
+    schwächer → beobachten). `/supportedentities?language=de` enthält jetzt
+    `IBAN_CODE`. `recognizers?language=de`: Email/Iban/Phone/CreditCard/… + Spacy.
+  - LEKTION (b) umgesetzt: Container-Healthcheck **loud-failing** —
+    `healthy` erst wenn `supportedentities?language=de` `IBAN_CODE` enthält.
+    Fehlkonfiguration hält den Container `unhealthy` statt PII still
+    durchzuwinken (Geist wie die 2.2c-GRANTs). Verifiziert: Container `healthy`.
+  - LEKTION (a) dokumentiert (Security-Block): Stub-Tests können Config-
+    Korrektheit echter Recognizer **prinzipiell nicht** abdecken — `stub_pii`
+    ist ein boolesches Orakel und hätte „Presidio erreichbar, erkennt aber
+    nichts wegen Registry-Fehlkonfig" nie gefunden. Nur der Live-Smoke fand es.
+  - Offen für User: `PRESIDIO_URL` in der echten `.env` setzen (fehlt noch),
+    dann der End-to-End-Smoke (IBAN-Prompt mit gpt-5.5 → mistral).
+
 - 2026-06-11: Task 4.5a abgeschlossen. PII-Erkennung + Sovereign-Routing
   (decyra-api + decyra-web). WORKPLAN-DoD: sensibler Prompt geht nie
   ungeschützt an ein Nicht-Sovereign-Modell.

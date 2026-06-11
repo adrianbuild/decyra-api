@@ -1,0 +1,8 @@
+# Presidio AnalyzerEngine configuration — German (Task 4.5a fix).
+# Pointed to by ANALYZER_CONF_FILE. The engine's supported_languages must
+# match the registry's (recognizers.yaml) and the NLP engine's (nlp.yaml) —
+# otherwise the worker refuses to boot ("supported languages have to be
+# consistent"). All three are "de".
+supported_languages:
+  - de
+default_score_threshold: 0

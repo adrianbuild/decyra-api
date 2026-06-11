@@ -40,6 +40,23 @@ services:
     ports:
       - "5002:3000"
     restart: unless-stopped
+    # Loud-failing health: the container is only "healthy" once the German
+    # registry actually exposes IBAN_CODE. A misconfiguration (NLP=de but
+    # registry stuck at en → pattern recognizers absent) keeps it unhealthy
+    # instead of silently passing PII through. (Same spirit as the 2.2c GRANTs.)
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, sys, urllib.request
+          d = json.load(urllib.request.urlopen("http://localhost:3000/supportedentities?language=de"))
+          sys.exit(0 if "IBAN_CODE" in d else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
 
 volumes:
   decyra_pgdata:
