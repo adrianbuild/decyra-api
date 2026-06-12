@@ -46,7 +46,11 @@ def test_subsequent_events_chain_correctly(db: Connection) -> None:
     assert rows[1].prev_hash == rows[0].current_hash
     assert rows[2].prev_hash == rows[1].current_hash
 
-    # Recompute hash[1] from scratch via Python module — must match DB.
+    # The 4.5b trigger emits v2, normalising the un-supplied mode fields to
+    # 'sovereign'/false. Recompute hash[1] via the Python v2 mirror — must match.
+    assert rows[1].canonical_version == "v2"
+    assert rows[1].pii_mode == "sovereign"
+    assert rows[1].anonymized is False
     py_hash_1 = compute_hash(
         AuditEventForHash(
             prev_hash=rows[0].current_hash,
@@ -56,6 +60,9 @@ def test_subsequent_events_chain_correctly(db: Connection) -> None:
             model="gpt-5",
             request_text="req1",
             response_text="res1",
+            canonical_version="v2",
+            pii_mode="sovereign",
+            anonymized=False,
         )
     )
     assert py_hash_1 == rows[1].current_hash

@@ -247,6 +247,7 @@ def stub_llm(monkeypatch):
         "id": "chatcmpl-test",
         "created": 1717000000,
         "raise_after": None,  # None = no abort; int k = raise after k chunks
+        "chunks": None,  # 4.5b: explicit content pieces (override word-split)
         "error_msg": "provider boom",
         # Task 4.6: model name -> exception instance to raise for that model
         # (non-stream: at the call; stream: on the first next()).
@@ -274,11 +275,19 @@ def stub_llm(monkeypatch):
     def _stream_chunks(model):  # type: ignore[no-untyped-def]
         if model in state["fail_models"]:
             raise state["fail_models"][model]  # connect-time failure (4.6)
-        tokens = state["content"].split(" ")
-        for i, tok in enumerate(tokens):
+        # `chunks` override (4.5b): explicit content pieces, so a test can split
+        # a placeholder across a chunk boundary. Otherwise split content by word.
+        tokens = (
+            list(state["chunks"])
+            if state.get("chunks") is not None
+            else [
+                (t if i == 0 else " " + t)
+                for i, t in enumerate(state["content"].split(" "))
+            ]
+        )
+        for i, piece in enumerate(tokens):
             if state["raise_after"] is not None and i >= state["raise_after"]:
                 raise RuntimeError(state["error_msg"])
-            piece = tok if i == 0 else " " + tok
             delta = types.SimpleNamespace(
                 role=("assistant" if i == 0 else None), content=piece
             )
@@ -354,6 +363,35 @@ def stub_pii(monkeypatch):
         return PiiOutcome("clean", False)
 
     monkeypatch.setattr("app.pii.contains_pii", _fake)
+    return types.SimpleNamespace(state=state)
+
+
+@pytest.fixture(autouse=True)
+def stub_analyze(monkeypatch):
+    """Patch app.pii.analyze_entities so the strict-mode anonymiser never calls
+    Presidio. Default: NO Presidio spans (local regex still runs for real, so
+    Steuer-ID/Kundennummer stay deterministic). `.state`:
+      - `spans_for`: {substring: entity_type} -> a Span per occurrence.
+      - `raise`: True -> simulate Presidio down (the strict path must fail-safe
+        reroute to sovereign)."""
+    import types
+
+    from app.pii import Span
+
+    state = {"spans_for": {}, "raise": False}
+
+    def _fake(text, settings=None):  # type: ignore[no-untyped-def]
+        if state["raise"]:
+            raise RuntimeError("presidio down")
+        spans = []
+        for needle, etype in state["spans_for"].items():
+            idx = text.find(needle)
+            while idx != -1:
+                spans.append(Span(idx, idx + len(needle), etype))
+                idx = text.find(needle, idx + 1)
+        return spans
+
+    monkeypatch.setattr("app.pii.analyze_entities", _fake)
     return types.SimpleNamespace(state=state)
 
 

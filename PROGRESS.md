@@ -3,14 +3,14 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 4 — Routing/Chat/PII**: 4.6 (Fehlerbehandlung & Fallback) abgeschlossen. **Block 4 fertig** bis auf 4.5b (Strict-Modus, bewusst zurückgestellt). Nächster Block: 5 (RAG) — oder 4.5b, falls priorisiert.
+**Block 4 — Routing/Chat/PII**: 4.5b (Strict-Modus) abgeschlossen. **Block 4 KOMPLETT fertig** (4.1–4.6 inkl. 4.5a+4.5b). Nächster Block: 5 (RAG). **127 Tests grün**, `npm run build` grün, Strict-Live-Smoke (nur Platzhalter an Anthropic) bestanden.
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
 - [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [x] 2.2c decyra_app-Switch + RLS scharf; [x] 2.3 Einladungen & Rollen; [ ] 2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
-- [~] Block 4 — Routing/Chat/PII ([x] 4.1 Phase A; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [x] 4.4 Streaming; [x] 4.5a PII-Erkennung + Sovereign-Routing; [x] 4.6 Fehler/Fallback; [ ] 4.5b Strict zurückgestellt)
+- [x] Block 4 — Routing/Chat/PII ([x] 4.1 Phase A; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [x] 4.4 Streaming; [x] 4.5a PII-Erkennung + Sovereign-Routing; [x] 4.5b Strict-Modus; [x] 4.6 Fehler/Fallback)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
 - [ ] Block 5B — Chat-Features (5B.1 Datei-Upload, 5B.2 Datenanalyse+Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects)
 - [ ] Block 6 — Frontend (6.1 Chat, 6.2 Dashboard Logs, 6.3 Dashboard Verwaltung)
@@ -54,10 +54,14 @@ Eigenschaften, vor Pilot bewerten):
   Namen unter dem `de`-Modell). 4.5a SENKT das Leak-Risiko, GARANTIERT keine
   100%-Erkennung. Vor Pilot: Erkennungsrate an echten Kundendaten messen,
   ggf. Custom-Recognizer ergänzen.
-- **DSGVO-Spannungsfeld (offen):** Original-`request_text` mit PII liegt in
-  der append-only-Hash-Kette (unlöschbar) vs. DSGVO-Löschrecht. Lösungs-
-  konzept (z.B. Krypto-Shredding / Pseudonymisierung des Audit-Texts) steht
-  aus — vor echten Personendaten klären.
+- **DSGVO-Spannungsfeld (für Sovereign offen, für Strict gelöst):** Im
+  Sovereign-Modus liegt Original-`request_text` mit PII in der append-only-
+  Hash-Kette (unlöschbar) vs. DSGVO-Löschrecht — Lösungskonzept (Krypto-
+  Shredding/Pseudonymisierung) für Sovereign steht weiter aus. **Strict (4.5b)
+  löst es per Konstruktion:** die Kette speichert nur die anonymisierte Fassung
+  (Platzhalter), echte PII liegt nur in der löschbaren `messages`-Tabelle. I5-
+  Regel: die Kette bezeugt in BEIDEN Modi, was WIRKLICH an die Cloud ging
+  (Sovereign=Original→EU, Strict=Platzhalter→gewählte Cloud).
 - **Degraded-Reroute nicht audit-unterscheidbar:** ein fail-safe-Reroute bei
   Presidio-Ausfall (`pii_detected=false`, `routed_to=mistral`) ist in
   `audit_events` nicht vom Clean-Mistral-Fall trennbar; nur via Log +
@@ -109,6 +113,56 @@ Die drei ursprünglichen Punkte:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-12: **Task 4.5b abgeschlossen — Strict-Modus** (anonymisieren →
+  Cloud → de-anonymisieren). 95 → **127 Tests grün**, `npm run build` grün,
+  Live-Smoke gegen echtes Presidio + echte Anthropic-Cloud bestanden.
+  - **`app/pii.py` (erweitert):** `analyze_entities` (Presidio-Spans statt nur
+    bool), `local_spans` (Steuer-ID/Kundennummer-Spans), `all_spans`,
+    `anonymize_messages`. `Anonymizer` (opake Platzhalter `[[DCY_<TYPE>_<n>]]`,
+    Wert-Dedup → gleicher Wert = gleicher Platzhalter, Overlap-Auflösung,
+    toleranter Reverse: Case/Space/Markdown). `StreamDeanonymizer`
+    (Boundary-Buffering, `MAX_PH=64`-Cap gegen halluziniertes `[[`).
+  - **Selbst-Anonymisierung statt Anonymizer-Container:** über die
+    Analyzer-Spans, die 4.5a verwarf, + lokale Regex-Spans. Presidios stock
+    `replace` ist irreversibel; reversibel bräuchte ohnehin eigenes Mapping —
+    und die lokalen Entitäten kennt Presidio gar nicht. Ein Pass, ein Mapping.
+  - **Canonical v2 (per-row Diskriminator):** Migration `f1a2b3c4d5e6`. Spalten
+    `audit_events.canonical_version` (DEFAULT 'v1' → Alt-Ketten unverändert),
+    `pii_mode`, `anonymized`. Trigger emittiert ab jetzt **v2** (bindet pii_mode
+    + anonymized in den Hash; normalisiert NULL→'sovereign'/false). `app/audit.py`
+    versions-aware: `canonical_string` verzweigt, `verify_chain` rechnet pro
+    Zeile mit ihrer Version → **gemischte v1/v2-Kette verifiziert**. Version-
+    Literal steckt im gehashten String → Diskriminator selbst-schützend.
+  - **`conversations.pii_mode`** (nullable, null=Workspace-Default). Modus pro
+    Chat wählbar; Request-Override persistiert; `get_conversation` liefert ihn.
+  - **Endpoint (`main.py`):** `_resolve_pii_mode` (Request → Konversation →
+    Workspace-Default). Strict+PII → `anonymize_messages` (nur Platzhalter an
+    den Provider), Modell bleibt gewählt, `anonymized=true`. Strict+Presidio-
+    Ausfall → **Fail-safe Reroute zu Sovereign** (I2). I5: Audit speichert, was
+    WIRKLICH rausging (Strict=Platzhalter, Sovereign=Original); `messages`
+    speichert echt (de-anonymisiert). Streaming deanonymisiert per
+    `StreamDeanonymizer`; Persistenz rebuildet aus Roh-Chunks + deanon in einem
+    Schritt (Live-Buffer kann Speicherung nie korrumpieren).
+  - **Frontend:** Umschalter (Souverän | Strict) neben dem Modell-Dropdown,
+    sendet `pii_mode`, lädt den Konversations-Modus beim Wechsel; Notizen für
+    Anonymisierung + Degrade; Strict-Hinweis (schwächere Compliance).
+  - **Live-Smoke-Fund (Lektion):** Presidio-Typen mit Unterstrich (IBAN_CODE,
+    EMAIL_ADDRESS, PHONE_NUMBER) brachen den Reverse-Regex (`[A-Za-z]+` spannt
+    kein `_`) → IBAN kam un-deanonymisiert zurück. Unit-Tests (Typen ohne `_`)
+    übersahen es; der Live-Smoke fand es. Fix: Entity-Typ auf reine Buchstaben
+    säubern (`IBAN_CODE`→`IBANCODE`) + Regressionstest. Wie 4.5a: diese
+    Fehlklasse findet nur der Live-Smoke.
+  - **Tests (+32):** `test_pii_anonymize` (10), `test_stream_deanonymize` (6),
+    `test_canonical_v2` (7, inkl. gemischte v1/v2-Kette + v2-Tamper),
+    `test_strict_mode` (9, inkl. „nur Platzhalter inkl. Historie an Provider",
+    Stream-Boundary, Modus-Auflösung, Fail-safe); `test_pii_routing`/
+    `test_hash_chain` auf v2 aktualisiert. Stubs: `stub_analyze` (Spans ohne
+    Presidio), `stub_llm.state['chunks']` (Platzhalter über Chunk-Grenze).
+  - **Bewusste Lücken:** Strict = schwächere Compliance (Kontext geht trotzdem
+    an die Cloud) — im UI dokumentiert. Erkennung statistisch (over-/under-
+    detection; „entwirf"→PERSON im Smoke = über-maskiert, safe). Degradierter
+    Strict (Presidio aus): `pii_mode='strict'` + `anonymized=false` +
+    `routed_to=mistral` erzählt die Degradierung vollständig.
 - 2026-06-12: Task 4.6 abgeschlossen. Fehlerbehandlung & sovereignty-aware
   Fallback. Provider-Ausfall → klare Meldung statt 500-Crash.
   - **`app/llm_call.py` (neu):** `FALLBACK_ERRORS` (Timeout/RateLimit/

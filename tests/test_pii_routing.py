@@ -233,9 +233,12 @@ async def test_no_sovereign_target_plus_pii_blocks_503(
 
 
 @pytest.mark.asyncio
-async def test_strict_mode_also_reroutes_in_4_5a(
-    client, db, make_token, stub_pii
+async def test_workspace_strict_default_anonymizes_not_reroutes(
+    client, db, make_token, stub_pii, stub_analyze
 ) -> None:
+    """4.5b: the WORKSPACE-level pii_mode='strict' default now ANONYMISES (keeps
+    the chosen model, sends only placeholders) instead of rerouting as in 4.5a.
+    No request/conversation override is given — the workspace default governs."""
     _org, ws = seed_org_with_owner(db, USER_A, "a@firma.de")
     _seed_model(db, CHOSEN)
     _seed_sovereign(db)
@@ -245,12 +248,17 @@ async def test_strict_mode_also_reroutes_in_4_5a(
         {"w": ws},
     )
     stub_pii.state["force"] = "detected"
+    stub_analyze.state["spans_for"] = {"Max Mustermann": "PERSON"}
     token = make_token(sub=USER_A, email="a@firma.de")
 
     r = await client.post(
-        "/v1/chat/completions", headers=_auth(token), json=_body(token, CHOSEN)
+        "/v1/chat/completions", headers=_auth(token),
+        json=_body(token, CHOSEN, content="Hilf Max Mustermann"),
     )
-    assert r.json()["decyra"]["effective_model"] == SOVEREIGN
+    d = r.json()["decyra"]
+    assert d["effective_model"] == CHOSEN  # no reroute
+    assert d["anonymized"] is True
+    assert d["pii_mode"] == "strict"
 
 
 @pytest.mark.asyncio

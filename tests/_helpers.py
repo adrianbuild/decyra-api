@@ -120,14 +120,20 @@ def insert_event(
     request: str,
     response: str,
     model: str = "gpt-5",
+    *,
+    pii_mode: str | None = None,
+    anonymized: bool | None = None,
 ):
+    """Insert an audit event through the (v2) hash-chain trigger. pii_mode /
+    anonymized are optional; the trigger normalises NULL to 'sovereign'/false."""
     return db.execute(
         text(
             "INSERT INTO audit_events "
             "(workspace_id, user_id, model, request_text, "
-            "response_text, routed_to) "
-            "VALUES (:w, :u, :m, :req, :res, 'openai') "
-            "RETURNING id, timestamp, prev_hash, current_hash"
+            "response_text, routed_to, pii_mode, anonymized) "
+            "VALUES (:w, :u, :m, :req, :res, 'openai', :pm, :anon) "
+            "RETURNING id, timestamp, prev_hash, current_hash, "
+            "canonical_version, pii_mode, anonymized"
         ),
         {
             "w": ws_id,
@@ -135,6 +141,8 @@ def insert_event(
             "m": model,
             "req": request,
             "res": response,
+            "pm": pii_mode,
+            "anon": anonymized,
         },
     ).one()
 
@@ -144,7 +152,8 @@ def select_chain(db: Connection, ws_id: str):
         db.execute(
             text(
                 "SELECT id, workspace_id, user_id, timestamp, model, "
-                "request_text, response_text, prev_hash, current_hash "
+                "request_text, response_text, prev_hash, current_hash, "
+                "canonical_version, pii_mode, anonymized "
                 "FROM audit_events WHERE workspace_id = :w "
                 "ORDER BY timestamp ASC, id ASC"
             ),

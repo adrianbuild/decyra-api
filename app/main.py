@@ -286,6 +286,12 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = None
     stream: bool | None = None
     conversation_id: str | None = None  # Decyra extension
+    # Task 4.5b: per-chat PII mode override. None -> inherit the conversation's
+    # stored mode, else the workspace default. Validated against the allowed set.
+    pii_mode: str | None = None
+
+
+_VALID_PII_MODES = ("sovereign", "strict")
 
 
 def _pii_mode(db: Connection, workspace_id: str) -> str:
@@ -297,7 +303,34 @@ def _pii_mode(db: Connection, workspace_id: str) -> str:
         {"w": workspace_id},
     ).one_or_none()
     mode = row.m if row is not None else None
-    return mode if mode in ("sovereign", "strict") else "sovereign"
+    return mode if mode in _VALID_PII_MODES else "sovereign"
+
+
+def _resolve_pii_mode(
+    db: Connection,
+    workspace_id: str,
+    conversation_id: str | None,
+    request_mode: str | None,
+) -> str:
+    """Per-chat mode resolution (Task 4.5b): explicit request override wins, else
+    the conversation's stored mode, else the workspace default. Secure default
+    is 'sovereign' at every step."""
+    if request_mode in _VALID_PII_MODES:
+        return request_mode
+    if conversation_id is not None:
+        row = db.execute(
+            text("SELECT pii_mode FROM conversations WHERE id = :c"),
+            {"c": conversation_id},
+        ).one_or_none()
+        if row is not None and row.pii_mode in _VALID_PII_MODES:
+            return row.pii_mode
+    return _pii_mode(db, workspace_id)
+
+
+def _delta_content(chunk) -> str | None:
+    choice = chunk.choices[0]
+    delta = getattr(choice, "delta", None)
+    return getattr(delta, "content", None) if delta is not None else None
 
 
 def _resolve_effective_model(
@@ -342,17 +375,23 @@ def _stream_turn(
     llm_input: list[dict],
     pii_detected: bool,
     pii_check: str,
+    pii_mode: str,
+    anonymized: bool,
+    anonymizer,
+    audit_request: str,
+    conv_pii_mode: str | None,
     settings: Settings,
     log_ctx: dict,
 ) -> Iterator[str]:
-    """Stream with sovereignty-aware fallback (4.6) + persist (4.4/4.5a).
+    """Stream with sovereignty-aware fallback (4.6) + persist (4.4/4.5a) +
+    strict de-anonymisation (4.5b).
 
-    The model is resolved BEFORE any client output via
-    ``open_stream_with_fallback`` (fallback only on a connect-time failure,
-    before the first chunk). Once a chunk has flowed the model is committed —
-    a mid-stream abort follows 4.4 (persist partial, error event, NO restart).
-    The status event therefore carries the REALLY used (possibly fallback)
-    model; persist/audit/cost use it too.
+    Strict (``anonymizer`` set): the provider streams placeholders. Raw chunks
+    are COLLECTED for persistence (rebuilt + de-anonymised in one shot, so a
+    truncated live buffer cannot corrupt storage), while a ``StreamDeanonymizer``
+    boundary-buffers the wire so the browser never sees a partial or un-replaced
+    placeholder (Invariant 1). Sovereign/non-PII: raw chunks are forwarded as
+    before.
     """
     collected: list = []
 
@@ -375,6 +414,8 @@ def _stream_turn(
         pii_check=pii_check,
         routed_to=used_row.provider,
         effective_model=used_model,
+        anonymized=anonymized,
+        pii_mode=pii_mode,
     )
 
     def _persist() -> str | None:
@@ -393,24 +434,54 @@ def _stream_turn(
                 cost_input=used_row.cost_input,
                 cost_output=used_row.cost_output,
                 pii_detected=pii_detected,
+                pii_mode=pii_mode,
+                anonymized=anonymized,
+                anonymizer=anonymizer,
+                audit_request=audit_request,
+                conv_pii_mode=conv_pii_mode,
             )
+
+    deanon = pii.StreamDeanonymizer(anonymizer) if anonymizer is not None else None
+
+    def _emit(chunk) -> Iterator[str]:
+        """Forward a provider chunk to the client. Strict: boundary-buffer +
+        de-anonymise; otherwise forward verbatim."""
+        if deanon is None:
+            yield chat.sse_chunk(chunk, existing_cid)
+            return
+        content = _delta_content(chunk)
+        if content:
+            safe = deanon.feed(content)
+            if safe:
+                yield chat.sse_content(safe, existing_cid)
 
     # First event: the PII/routing status (now carrying the real model).
     yield chat.sse_status(status_block)
     try:
         if first_chunk is not None:
             collected.append(first_chunk)
-            yield chat.sse_chunk(first_chunk, existing_cid)
+            yield from _emit(first_chunk)
         for chunk in it:
             collected.append(chunk)
-            yield chat.sse_chunk(chunk, existing_cid)
+            yield from _emit(chunk)
     except GeneratorExit:
+        # Client disconnected: persist (independent of the live buffer); no emit.
         _persist()
         raise
     except Exception as e:
+        # Provider aborted mid-stream: flush any buffered (de-anonymised) tail
+        # so it is not lost, then surface the error and persist the partial.
+        if deanon is not None:
+            tail = deanon.flush()
+            if tail:
+                yield chat.sse_content(tail, existing_cid)
         cid = _persist()
         yield chat.sse_error(str(e), cid or existing_cid)
         return
+    if deanon is not None:
+        tail = deanon.flush()
+        if tail:
+            yield chat.sse_content(tail, existing_cid)
     cid = _persist()
     yield chat.sse_final(cid or existing_cid, used_model)
     yield chat.sse_done()
@@ -481,24 +552,70 @@ def chat_completions(
         llm_input = new_messages
 
     # --- PII check on the FULL llm_input (history + new) — Invariant 1 ---
-    # Runs in both sovereign and strict modes (in 4.5a strict behaves like
-    # sovereign). Scanning the whole input gives the one-way ratchet for
-    # free AND is necessary: history is re-sent, so a later "clean" turn
-    # must not leak earlier PII to a non-sovereign model.
-    _mode = _pii_mode(db_read, ws)  # noqa: F841 — both modes protect in 4.5a
+    # The whole input is scanned in BOTH modes: history is re-sent, so a later
+    # clean turn must not leak earlier PII. The MODE then decides the handling:
+    # sovereign reroutes to an EU model; strict anonymises in place and keeps the
+    # chosen (cloud) model, sending only placeholders (Task 4.5b).
+    if payload.pii_mode is not None and payload.pii_mode not in _VALID_PII_MODES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="pii_mode must be 'sovereign' or 'strict'",
+        )
+    mode = _resolve_pii_mode(db_read, ws, existing_cid, payload.pii_mode)
+    # Explicit per-chat override to persist onto the conversation (or None).
+    conv_pii_mode = payload.pii_mode
+
     full_text = "\n".join(m["content"] for m in llm_input if m.get("content"))
     outcome = pii.contains_pii(full_text, settings)
-    effective_model, eff_row = _resolve_effective_model(
-        db_read,
-        chosen_model=payload.model,
-        chosen_row=model_row,
-        outcome=outcome,
-        settings=settings,
-    )
-    if effective_model != payload.model:
-        if outcome.status == "unavailable":
+
+    anonymizer = None
+    anonymized = False
+    llm_input_for_provider = llm_input
+    audit_request = chat.audit_request_text(new_messages)
+
+    if mode == "strict" and outcome.detected:
+        # Anonymise the WHOLE input, keep the chosen model, send only
+        # placeholders (Invariant 2). If Presidio is unavailable mid-anonymise
+        # we cannot guarantee a clean mask -> fail-safe sovereign reroute rather
+        # than risk leaking un-masked PII.
+        try:
+            llm_input_for_provider, anonymizer = pii.anonymize_messages(
+                llm_input, settings
+            )
+            anonymized = True
+            effective_model, eff_row = payload.model, model_row  # no reroute
+            anon_new = llm_input_for_provider[len(llm_input) - len(new_messages) :]
+            audit_request = chat.audit_request_text(anon_new)
+        except Exception:  # noqa: BLE001 — Presidio down => fail-safe reroute
+            anonymizer = None
+            anonymized = False
+            llm_input_for_provider = llm_input
             logger.warning(
-                "PII check unavailable — fail-safe reroute %s -> %s (ws=%s)",
+                "strict anonymisation unavailable — fail-safe sovereign "
+                "reroute (ws=%s)", ws,
+            )
+            effective_model, eff_row = _resolve_effective_model(
+                db_read,
+                chosen_model=payload.model,
+                chosen_row=model_row,
+                outcome=pii.PiiOutcome("unavailable", False),
+                settings=settings,
+            )
+    else:
+        # Sovereign mode, strict-without-PII, or an unavailable check: the 4.5a
+        # reroute logic (reroute only when protection is needed).
+        effective_model, eff_row = _resolve_effective_model(
+            db_read,
+            chosen_model=payload.model,
+            chosen_row=model_row,
+            outcome=outcome,
+            settings=settings,
+        )
+
+    if effective_model != payload.model:
+        if outcome.status == "unavailable" or (mode == "strict" and not anonymized):
+            logger.warning(
+                "PII protection — fail-safe reroute %s -> %s (ws=%s)",
                 payload.model, effective_model, ws,
             )
         else:
@@ -512,13 +629,13 @@ def chat_completions(
         db_read, effective_model, eff_row, settings
     )
     log_ctx = {"workspace_id": ws, "user_id": user.user_id}
-    kwargs: dict = {"messages": llm_input}
+    kwargs: dict = {"messages": llm_input_for_provider}
     if payload.temperature is not None:
         kwargs["temperature"] = payload.temperature
     if payload.max_tokens is not None:
         kwargs["max_tokens"] = payload.max_tokens
 
-    # --- Streaming path (Task 4.4 + 4.5a + 4.6) ------------------------
+    # --- Streaming path (Task 4.4 + 4.5 + 4.6) -------------------------
     if payload.stream:
         return StreamingResponse(
             _stream_turn(
@@ -529,9 +646,14 @@ def chat_completions(
                 user_id=user.user_id,
                 existing_cid=existing_cid,
                 new_messages=new_messages,
-                llm_input=llm_input,
+                llm_input=llm_input_for_provider,
                 pii_detected=outcome.detected,
                 pii_check=outcome.status,
+                pii_mode=mode,
+                anonymized=anonymized,
+                anonymizer=anonymizer,
+                audit_request=audit_request,
+                conv_pii_mode=conv_pii_mode,
                 settings=settings,
                 log_ctx=log_ctx,
             ),
@@ -552,7 +674,15 @@ def chat_completions(
     except litellm.APIError:  # auth/permission/notfound/…
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=_PROVIDER_ERROR_MSG)
 
-    assistant_content = resp.choices[0].message.content or ""
+    # Strict: the provider answered in placeholders. The client + stored message
+    # get the REAL (de-anonymised) text; the AUDIT gets the anonymised text that
+    # actually transited (I5: the chain attests what really went to the cloud).
+    provider_content = resp.choices[0].message.content or ""
+    display_content = (
+        anonymizer.deanonymize(provider_content)
+        if anonymizer is not None
+        else provider_content
+    )
     cost = chat.compute_cost(
         resp.usage.prompt_tokens,
         resp.usage.completion_tokens,
@@ -564,6 +694,8 @@ def chat_completions(
         pii_check=outcome.status,
         routed_to=used_row.provider,
         effective_model=used_model,
+        anonymized=anonymized,
+        pii_mode=mode,
     )
 
     # messages.workspace_id is always ws (the conversation's workspace),
@@ -573,9 +705,12 @@ def chat_completions(
         set_workspace_context(db_write, ws)
         if payload.conversation_id:
             cid = payload.conversation_id
+            if conv_pii_mode is not None:
+                chat.set_conversation_mode(db_write, cid, conv_pii_mode)
         else:
             cid = chat.create_conversation(
-                db_write, ws, user.user_id, chat.derive_title(new_messages)
+                db_write, ws, user.user_id, chat.derive_title(new_messages),
+                conv_pii_mode,
             )
         for m in chat.persistable_messages(new_messages):
             chat.insert_message(db_write, cid, ws, m["role"], m["content"])
@@ -584,7 +719,7 @@ def chat_completions(
             cid,
             ws,
             "assistant",
-            assistant_content,
+            display_content,
             model=used_model,
             prompt_tokens=resp.usage.prompt_tokens,
             completion_tokens=resp.usage.completion_tokens,
@@ -596,12 +731,16 @@ def chat_completions(
             ws,
             user.user_id,
             used_model,
-            chat.audit_request_text(new_messages),
-            assistant_content,
+            audit_request,
+            provider_content,
             used_row.provider,
             outcome.detected,
+            pii_mode=mode,
+            anonymized=anonymized,
         )
-    return chat.build_openai_response(resp, used_model, cid, status_block)
+    out = chat.build_openai_response(resp, used_model, cid, status_block)
+    out["choices"][0]["message"]["content"] = display_content
+    return out
 
 
 @app.get("/conversations")
@@ -649,7 +788,7 @@ def get_conversation(
     set_workspace_context(db, member.workspace_id)
     conv = db.execute(
         text(
-            "SELECT id, title, created_at, updated_at FROM conversations "
+            "SELECT id, title, pii_mode, created_at, updated_at FROM conversations "
             "WHERE id = :c AND user_id = :u"
         ),
         {"c": str(conversation_id), "u": user.user_id},
@@ -668,6 +807,7 @@ def get_conversation(
     return {
         "id": str(conv.id),
         "title": conv.title,
+        "pii_mode": conv.pii_mode,
         "created_at": conv.created_at.isoformat(),
         "updated_at": conv.updated_at.isoformat(),
         "messages": [

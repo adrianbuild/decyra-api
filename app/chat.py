@@ -122,15 +122,21 @@ def load_history(db: Connection, conversation_id: str) -> list[dict]:
 
 
 def create_conversation(
-    db: Connection, workspace_id: str, user_id: str, title: str
+    db: Connection,
+    workspace_id: str,
+    user_id: str,
+    title: str,
+    pii_mode: str | None = None,
 ) -> str:
+    """Create a conversation. ``pii_mode`` is the per-chat override (Task 4.5b);
+    None means inherit the workspace default."""
     return str(
         db.execute(
             text(
-                "INSERT INTO conversations (workspace_id, user_id, title) "
-                "VALUES (:w, :u, :t) RETURNING id"
+                "INSERT INTO conversations (workspace_id, user_id, title, "
+                "pii_mode) VALUES (:w, :u, :t, :pm) RETURNING id"
             ),
-            {"w": workspace_id, "u": user_id, "t": title},
+            {"w": workspace_id, "u": user_id, "t": title, "pm": pii_mode},
         ).scalar_one()
     )
 
@@ -175,6 +181,17 @@ def touch_conversation(db: Connection, conversation_id: str) -> None:
     )
 
 
+def set_conversation_mode(
+    db: Connection, conversation_id: str, pii_mode: str
+) -> None:
+    """Persist a per-chat PII-mode toggle onto an existing conversation
+    (Task 4.5b). New conversations get it at creation instead."""
+    db.execute(
+        text("UPDATE conversations SET pii_mode = :pm WHERE id = :c"),
+        {"pm": pii_mode, "c": conversation_id},
+    )
+
+
 def insert_audit_event(
     db: Connection,
     workspace_id: str,
@@ -184,17 +201,25 @@ def insert_audit_event(
     response_text: str,
     routed_to: str,
     pii_detected: bool = False,
+    *,
+    pii_mode: str = "sovereign",
+    anonymized: bool = False,
 ) -> None:
-    """Append an audit event. The BEFORE INSERT trigger (3.1) chains the
-    hashes. ``model``/``routed_to`` are the EFFECTIVE model/provider (after
-    any sovereign reroute). ``pii_detected`` is true only when PII was
-    actually detected — a degraded (Presidio-down) reroute leaves it false
-    (distinguishable; see Task 4.5a)."""
+    """Append an audit event. The BEFORE INSERT trigger (3.1/4.5b) chains the
+    hashes and binds ``pii_mode`` + ``anonymized`` into the canonical v2 string.
+    ``model``/``routed_to`` are the EFFECTIVE model/provider (after any sovereign
+    reroute). ``pii_detected`` is true whenever PII was actually detected —
+    including strict mode, where it was anonymised rather than rerouted (a
+    degraded Presidio-down reroute still leaves it false). ``request_text`` /
+    ``response_text`` are what ACTUALLY transited to the provider: the original
+    in sovereign mode (real text went to the EU model), the anonymised text in
+    strict mode (only placeholders left the house) — the chain attests both."""
     db.execute(
         text(
             "INSERT INTO audit_events (workspace_id, user_id, model, "
-            "request_text, response_text, routed_to, pii_detected) "
-            "VALUES (:w, :u, :m, :req, :res, :routed, :pii)"
+            "request_text, response_text, routed_to, pii_detected, "
+            "pii_mode, anonymized) "
+            "VALUES (:w, :u, :m, :req, :res, :routed, :pii, :mode, :anon)"
         ),
         {
             "w": workspace_id,
@@ -204,6 +229,8 @@ def insert_audit_event(
             "res": response_text,
             "routed": routed_to,
             "pii": pii_detected,
+            "mode": pii_mode,
+            "anon": anonymized,
         },
     )
 
@@ -255,27 +282,43 @@ def persist_stream_turn(
     cost_input: float,
     cost_output: float,
     pii_detected: bool = False,
+    pii_mode: str = "sovereign",
+    anonymized: bool = False,
+    anonymizer=None,
+    audit_request: str | None = None,
+    conv_pii_mode: str | None = None,
 ) -> str | None:
-    """Persist a streamed turn + write the audit event — byte-for-byte the
-    same write block as the 4.3 non-streaming path, only sourcing the
-    assistant content/usage from the collected chunks. ``model``/``provider``/
-    prices are the EFFECTIVE model (after any sovereign reroute). Creates the
-    conversation when ``existing_cid`` is None (so an aborted turn that
-    produced nothing leaves NO orphan — decyra_app cannot DELETE
-    conversations). Returns the conversation id, or None if nothing was
-    collected (skip).
+    """Persist a streamed turn + write the audit event — the same write block as
+    the 4.3 non-streaming path, sourcing the assistant content/usage from the
+    collected chunks. ``model``/``provider``/prices are the EFFECTIVE model.
 
-    The caller must have set the workspace RLS context on ``db_write``
-    before calling (same as the 4.3 block)."""
+    Strict-mode divergence (Task 4.5b): the collected chunks carry the provider
+    (anonymised) content. ``messages`` stores the REAL, de-anonymised text
+    (tenant data); the AUDIT stores what actually transited — the anonymised
+    request (``audit_request``) and the anonymised provider response. ``pii_mode``
+    is the governing mode; ``conv_pii_mode`` is the per-chat override persisted
+    on a freshly-created conversation. ``anonymizer`` (or None) de-anonymises the
+    stored assistant content. Returns the conversation id, or None if nothing
+    was collected (skip)."""
     rebuilt = rebuild_stream_response(chunks, llm_input)
     if rebuilt is None:
         return None
-    assistant_content, prompt_tokens, completion_tokens = rebuilt
+    provider_content, prompt_tokens, completion_tokens = rebuilt
+    stored_content = (
+        anonymizer.deanonymize(provider_content)
+        if anonymizer is not None
+        else provider_content
+    )
     cost = compute_cost(prompt_tokens, completion_tokens, cost_input, cost_output)
 
-    cid = existing_cid or create_conversation(
-        db_write, workspace_id, user_id, derive_title(new_messages)
-    )
+    if existing_cid is None:
+        cid = create_conversation(
+            db_write, workspace_id, user_id, derive_title(new_messages), conv_pii_mode
+        )
+    else:
+        cid = existing_cid
+        if conv_pii_mode is not None:
+            set_conversation_mode(db_write, cid, conv_pii_mode)
     for m in persistable_messages(new_messages):
         insert_message(db_write, cid, workspace_id, m["role"], m["content"])
     insert_message(
@@ -283,7 +326,7 @@ def persist_stream_turn(
         cid,
         workspace_id,
         "assistant",
-        assistant_content,
+        stored_content,
         model=model,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
@@ -295,10 +338,12 @@ def persist_stream_turn(
         workspace_id,
         user_id,
         model,
-        audit_request_text(new_messages),
-        assistant_content,
+        audit_request if audit_request is not None else audit_request_text(new_messages),
+        provider_content,
         provider,
         pii_detected,
+        pii_mode=pii_mode,
+        anonymized=anonymized,
     )
     return cid
 
@@ -357,6 +402,24 @@ def sse_final(conversation_id: str | None, model: str) -> str:
     return f"data: {json.dumps(d)}\n\n"
 
 
+def sse_content(text_piece: str, conversation_id: str | None = None) -> str:
+    """A content-only OpenAI chunk. Used by the strict streaming path to emit
+    DE-ANONYMISED text (the provider's raw placeholder chunks are not forwarded;
+    they pass through the StreamDeanonymizer first)."""
+    d: dict = {
+        "id": "chatcmpl-decyra",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": None,
+        "choices": [
+            {"index": 0, "delta": {"content": text_piece}, "finish_reason": None}
+        ],
+    }
+    if conversation_id is not None:
+        d["conversation_id"] = conversation_id
+    return f"data: {json.dumps(d)}\n\n"
+
+
 def sse_error(message: str, conversation_id: str | None = None) -> str:
     d: dict = {"error": {"message": message, "type": "stream_error"}}
     if conversation_id is not None:
@@ -374,15 +437,19 @@ def pii_status(
     pii_check: str,
     routed_to: str,
     effective_model: str,
+    anonymized: bool = False,
+    pii_mode: str = "sovereign",
 ) -> dict:
-    """The Decyra PII/routing status block (Task 4.5a). anonymized is always
-    false in 4.5a — schema-stable for 4.5b (strict mode)."""
+    """The Decyra PII/routing status block. ``anonymized`` is true only when
+    strict mode actually masked PII before the cloud call (Task 4.5b);
+    ``pii_mode`` is the mode that governed this request."""
     return {
         "pii_detected": pii_detected,
         "pii_check": pii_check,
         "routed_to": routed_to,
         "effective_model": effective_model,
-        "anonymized": False,
+        "anonymized": anonymized,
+        "pii_mode": pii_mode,
     }
 
 

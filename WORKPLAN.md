@@ -209,10 +209,17 @@
 - **Audit:** `request_text` bleibt Original; `pii_detected=true` nur bei echter Erkennung (Degraded-Reroute → false + `pii_check=unavailable`, via Log/Response sichtbar). `model`/`routed_to`/`cost` = EFFEKTIVES Modell.
 - Bewusste Lücken (Security-Block): Erkennung statistisch (Falsch-Negative real); DSGVO-Spannungsfeld (PII in unlöschbarer Kette); Degraded-Reroute im Audit nicht vom Clean-Fall unterscheidbar; `de`-only-Scan.
 
-#### Task 4.5b — Strict-Modus (später)
-- [ ] PII anonymisieren → Cloud-Modell → De-Anonymisierung der Antwort
-- [ ] `anonymized`-Flag echt setzen; Admin-UI fürs `pii_mode`-Setting
-- (in 4.5a verhält sich `strict` wie `sovereign`: Reroute statt Anonymisierung)
+#### Task 4.5b — Strict-Modus ✅ (2026-06-12)
+- [x] PII anonymisieren (selbst über Presidio-Analyzer-Spans + lokale Regex-Spans, ein Mapping) → Cloud-Modell sieht nur Platzhalter → De-Anonymisierung der Antwort (auch im Stream, Boundary-Buffering)
+- [x] Modus **pro Chat** wählbar: `conversations.pii_mode` (nullable, null=Workspace-Default), Request-Override persistiert auf die Konversation; Frontend-Umschalter neben dem Modell-Dropdown
+- [x] `anonymized`-Flag echt gesetzt (true nur wenn Strict tatsächlich anonymisiert hat); `pii_detected` bleibt true auch im Strict-Fall (erkannt, nur anders behandelt)
+- [x] **Modus in der unveränderlichen Kette getrackt**: Canonical **v2** (per-row Diskriminator) bindet `pii_mode` + `anonymized` in den Hash; Alt-v1-Ketten brechen nicht (DEFAULT-'v1'-Backfill), gemischte v1/v2-Kette verifiziert
+- [x] I5: Audit speichert, was WIRKLICH an die Cloud ging — Sovereign=Original (real an EU), Strict=Platzhalter (nur die gingen raus). Löst das DSGVO-Spannungsfeld für Strict
+- [x] I2-Fail-safe: Strict + Presidio-Ausfall → Reroute zu Sovereign (nie un-maskierte PII), transparente Notiz
+- [x] Platzhalter-Format `[[DCY_<TYPE>_<n>]]` opak + toleranter Reverse (Case/Space/Markdown); unmatched bleibt sichtbar (kein PII-Leak)
+- **DoD:** Strict anonymisiert vor dem Cloud-Call, de-anonymisiert korrekt (Stream+non-Stream), Modus pro Chat + in der Kette, alle Tests grün ✅ (**127 Tests grün**, `npm run build` grün; Live-Smoke: echter Strict-Prompt → nur Platzhalter an Anthropic, Presidio-Beweis)
+- **KEIN** Admin-UI (Entscheidung: Wahl pro Chat im Frontend-Umschalter, kein Workspace-Setting-UI nötig)
+- Bewusste Lücke: Strict = schwächere Compliance (Kontext geht trotzdem an die Cloud, nur PII anonymisiert) — im Frontend dokumentiert; PII-Erkennung statistisch (Presidio over-/under-detection, z.B. Verb „entwirf" als PERSON — über-maskiert ist safe)
 
 ### Task 4.6 — Fehlerbehandlung & Fallback ✅ (2026-06-12)
 - [x] Provider-Timeout/Fehler abfangen, sauberer Error ans Frontend (non-stream 503/400/502 mit fixen Texten ohne Key-Leak; stream → sse_error)

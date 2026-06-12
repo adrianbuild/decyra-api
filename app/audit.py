@@ -24,9 +24,6 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-CANONICAL_VERSION = "v1"
-
-
 @dataclass(frozen=True, slots=True)
 class AuditEventForHash:
     prev_hash: str | None
@@ -36,6 +33,14 @@ class AuditEventForHash:
     model: str
     request_text: str
     response_text: str
+    # Task 4.5b — per-row canonical version. Existing rows are v1 (the column
+    # default backfills them); v2 additionally binds pii_mode + anonymized into
+    # the hash. The version literal lives INSIDE the canonical string, so the
+    # stored discriminator is self-protecting (faking it flips the formula and
+    # the recomputed hash no longer matches).
+    canonical_version: str = "v1"
+    pii_mode: str | None = None  # only hashed in v2
+    anonymized: bool | None = None  # only hashed in v2
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,18 +60,22 @@ def _format_ts(ts: datetime) -> str:
 
 
 def canonical_string(e: AuditEventForHash) -> str:
-    return "|".join(
-        [
-            CANONICAL_VERSION,
-            e.prev_hash or "",
-            str(e.workspace_id),
-            str(e.user_id),
-            _format_ts(e.timestamp),
-            _length_prefixed(e.model),
-            _length_prefixed(e.request_text),
-            _length_prefixed(e.response_text),
-        ]
-    )
+    parts = [
+        e.canonical_version,
+        e.prev_hash or "",
+        str(e.workspace_id),
+        str(e.user_id),
+        _format_ts(e.timestamp),
+        _length_prefixed(e.model),
+        _length_prefixed(e.request_text),
+        _length_prefixed(e.response_text),
+    ]
+    if e.canonical_version == "v2":
+        # MUST mirror the plpgsql trigger exactly: length-prefixed pii_mode
+        # (normalised to 'sovereign' if absent) + a 'true'/'false' literal.
+        parts.append(_length_prefixed(e.pii_mode or "sovereign"))
+        parts.append("true" if e.anonymized else "false")
+    return "|".join(parts)
 
 
 def compute_hash(e: AuditEventForHash) -> str:
@@ -75,10 +84,10 @@ def compute_hash(e: AuditEventForHash) -> str:
     ).hexdigest()
 
 
-def _get(ev: AuditEventForHash | dict, key: str):
+def _get(ev: AuditEventForHash | dict, key: str, default=None):
     if isinstance(ev, dict):
-        return ev[key]
-    return getattr(ev, key)
+        return ev.get(key, default)
+    return getattr(ev, key, default)
 
 
 def verify_chain(
@@ -115,6 +124,11 @@ def verify_chain(
             model=_get(ev, "model"),
             request_text=_get(ev, "request_text"),
             response_text=_get(ev, "response_text"),
+            # Default v1 so pre-4.5b rows (and any caller omitting the column)
+            # recompute with the original formula.
+            canonical_version=_get(ev, "canonical_version", "v1") or "v1",
+            pii_mode=_get(ev, "pii_mode"),
+            anonymized=_get(ev, "anonymized"),
         )
         if compute_hash(to_hash) != stored_current:
             return VerifyResult(
@@ -142,7 +156,8 @@ def verify_workspace_chain(
         db.execute(
             text(
                 "SELECT id, workspace_id, user_id, timestamp, model, "
-                "request_text, response_text, prev_hash, current_hash "
+                "request_text, response_text, prev_hash, current_hash, "
+                "canonical_version, pii_mode, anonymized "
                 "FROM audit_events WHERE workspace_id = :w "
                 "ORDER BY timestamp ASC, id ASC"
             ),
