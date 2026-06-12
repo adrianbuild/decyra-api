@@ -248,6 +248,9 @@ def stub_llm(monkeypatch):
         "created": 1717000000,
         "raise_after": None,  # None = no abort; int k = raise after k chunks
         "error_msg": "provider boom",
+        # Task 4.6: model name -> exception instance to raise for that model
+        # (non-stream: at the call; stream: on the first next()).
+        "fail_models": {},
     }
     calls: list[dict] = []
 
@@ -269,6 +272,8 @@ def stub_llm(monkeypatch):
         )
 
     def _stream_chunks(model):  # type: ignore[no-untyped-def]
+        if model in state["fail_models"]:
+            raise state["fail_models"][model]  # connect-time failure (4.6)
         tokens = state["content"].split(" ")
         for i, tok in enumerate(tokens):
             if state["raise_after"] is not None and i >= state["raise_after"]:
@@ -292,9 +297,12 @@ def stub_llm(monkeypatch):
 
     def _completion(**kwargs):  # type: ignore[no-untyped-def]
         calls.append(kwargs)
+        model = kwargs.get("model")
         if kwargs.get("stream"):
-            return _stream_chunks(kwargs.get("model"))
-        return _make_response(kwargs.get("model"))
+            return _stream_chunks(model)  # may raise on first next()
+        if model in state["fail_models"]:
+            raise state["fail_models"][model]  # 4.6 provider failure
+        return _make_response(model)
 
     def _chunk_builder(chunks, messages=None, **kw):  # type: ignore[no-untyped-def]
         # Reconstruct content from the GIVEN chunks (so partial vs full

@@ -47,6 +47,20 @@ class Settings(BaseSettings):
     # model the user originally picked.
     sovereign_model: str = "mistral/mistral-large-latest"
 
+    # Error handling + fallback (Task 4.6).
+    # Fallback chain for NON-sovereign requests (a sovereign request only ever
+    # falls back to other sovereign_eligible models). Default = the sovereign
+    # models: resilient out of the box, and EU is never the wrong direction.
+    # Each entry is validated against `enabled` at use. .env override: JSON list.
+    fallback_models: list[str] = [
+        "mistral/mistral-large-latest",
+        "mistral/mistral-small-latest",
+    ]
+    # Per-model request timeout (passed to litellm `timeout`).
+    request_timeout_seconds: float = 60.0
+    # Per-model transient retry with backoff (passed to litellm `num_retries`).
+    num_retries: int = 2
+
 
 @lru_cache
 def get_settings() -> Settings:

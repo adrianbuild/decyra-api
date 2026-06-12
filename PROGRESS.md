@@ -3,14 +3,14 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 4 — Routing/Chat/PII**: 4.5a (PII-Erkennung + Sovereign-Routing) abgeschlossen. Offen in Block 4: 4.5b (Strict-Modus) und 4.6 (Fehler/Fallback).
+**Block 4 — Routing/Chat/PII**: 4.6 (Fehlerbehandlung & Fallback) abgeschlossen. **Block 4 fertig** bis auf 4.5b (Strict-Modus, bewusst zurückgestellt). Nächster Block: 5 (RAG) — oder 4.5b, falls priorisiert.
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
 - [x] Block 1 — Projekt-Setup ([x] 1.1 Repos, [x] 1.2 Tests, [x] 1.3 DB-Schema)
 - [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [x] 2.2c decyra_app-Switch + RLS scharf; [x] 2.3 Einladungen & Rollen; [ ] 2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
-- [~] Block 4 — Routing/Chat/PII ([x] 4.1 Phase A; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [x] 4.4 Streaming; [x] 4.5a PII-Erkennung + Sovereign-Routing; [ ] 4.5b Strict / [ ] 4.6)
+- [~] Block 4 — Routing/Chat/PII ([x] 4.1 Phase A; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [x] 4.4 Streaming; [x] 4.5a PII-Erkennung + Sovereign-Routing; [x] 4.6 Fehler/Fallback; [ ] 4.5b Strict zurückgestellt)
 - [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
 - [ ] Block 5B — Chat-Features (5B.1 Datei-Upload, 5B.2 Datenanalyse+Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects)
 - [ ] Block 6 — Frontend (6.1 Chat, 6.2 Dashboard Logs, 6.3 Dashboard Verwaltung)
@@ -34,6 +34,12 @@
 Die drei 2.2-Punkte sind erledigt (siehe unten). NEU aus 4.5a (bewusste
 Eigenschaften, vor Pilot bewerten):
 
+- **Sovereign-Resilienz braucht ≥2 enabled `sovereign_eligible` Modelle (4.6).**
+  Der Fallback einer PII-souveränen Anfrage weicht NUR auf andere
+  `sovereign_eligible` Modelle aus (nie Nicht-EU). Mit nur einem (z.B. nur
+  mistral-large) gibt es bei dessen Ausfall keinen Sovereign-Fallback → harte
+  **503-Kante** (korrekt nach Invariante 1, aber muss bekannt sein). Vor Pilot:
+  mistral-large UND mistral-small enabled halten.
 - **Pflicht-Live-Smoke vor Pilot (Presidio-Config-Korrektheit).** Stub-Tests
   können die Korrektheit der ECHTEN Recognizer-Konfiguration prinzipiell nicht
   prüfen (`stub_pii` ist ein boolesches Orakel). Daher fester manueller Check
@@ -103,6 +109,51 @@ Die drei ursprünglichen Punkte:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-12: Task 4.6 abgeschlossen. Fehlerbehandlung & sovereignty-aware
+  Fallback. Provider-Ausfall → klare Meldung statt 500-Crash.
+  - **`app/llm_call.py` (neu):** `FALLBACK_ERRORS` (Timeout/RateLimit/
+    ServiceUnavailable/APIConnection/InternalServer → retry+fallback) vs
+    `PERMANENT_ERRORS` (BadRequest inkl. ContextWindowExceeded/Auth/NotFound/
+    PermissionDenied → kein Fallback). `build_candidates` (Primär + `seen`-
+    Dedup; sovereign → nur enabled `sovereign_eligible` aus DB; non-sovereign
+    → `fallback_models` je gegen enabled validiert). `complete_with_fallback`
+    (non-stream) + `open_stream_with_fallback` (stream, erzwingt ersten Chunk
+    → Fallback nur vor Client-Output). Ein generisches `except Exception`
+    macht JEDEN unerwarteten Fehler fallback-würdig → nie Crash.
+    `ProvidersUnavailable` (alle Kandidaten tot). `decyra.errors`-Logger.
+  - **`app/main.py`:** nach der PII-Entscheidung `candidates`; `kwargs` ohne
+    model (Executor setzt es). non-stream: try/except → 503 (erschöpft) /
+    400 (BadRequest) / 502 (sonstige APIError), fixe Texte ohne Key-Leak.
+    Status/Audit/Cost/`message.model` = WIRKLICH genutztes (ggf. Fallback-)
+    Modell; `_stream_turn` löst das Modell via `open_stream_with_fallback`
+    auf, sendet sse_status DANACH (echtes Modell), Mid-Stream = 4.4 (kein
+    Fallback-Neustart). Fehlgeschlagener Call → KEIN Audit-Event.
+  - **`app/config.py`:** `fallback_models` (Default = Mistral large+small),
+    `request_timeout_seconds=60.0`, `num_retries=2`.
+  - **Stub (`conftest.stub_llm`):** `state["fail_models"]` (model → Exception);
+    non-stream wirft sofort, Stream-Generator beim ersten `next()`. Default
+    leer → 84 Vor-Tests grün.
+  - **Invarianten getestet (1–4):** sovereign fällt nur auf sovereign (gpt-5.5
+    nie gerufen); nur-1-sovereign-Ausfall → 503 ohne Nicht-EU; Compliance/
+    Kette nach Fallback; Error-Log getrennt + 0 Audit bei Total-Ausfall;
+    Streaming-Fallback vor erstem Chunk; Streaming Mid-Stream = 4.4 (persist
+    Teilantwort mit Primär-Modell, kein Fallback); non-sovereign-Default-
+    Fallback = sovereign; Dedup; permanent → 400 ohne Fallback.
+  - DEBUG (Diagnose vor Fix, 2 rote): (1) ECHTE Regression — `raise_after=0`
+    (Null-Content, RuntimeError vor 1. Chunk) entkam dem Executor (fing nur
+    litellm-Fehler) → Fix: generisches `except Exception` als fallback-würdig
+    (nie Crash). (2) Test-Artefakt — `decyra.errors` war `disabled=True`, weil
+    **alembics `fileConfig` (conftest-Session-Setup) `disable_existing_loggers`
+    setzt**; KEIN Prod-Risiko (alembic läuft als eigener Prozess). Fix:
+    Logger im Unit-Test hermetisch re-enabled. Diagnose-Kette: caplog leer →
+    eigener Handler leer → `_log_failure` lief 2× (also geloggt) → `isEnabledFor`
+    False trotz Level 30 → `logger.disabled=True` → alembic als Quelle.
+  - Verifikation: `pytest -q` **95 grün** (84→95, +11 in test_fallback.py).
+    `npm run build` grün (kein FE-Diff — bestehender onError/Inline zeigt die
+    Fehler; SSE-error-Event greift). Echte Provider-Fehler bleiben Live-Demo.
+  - Scope: kein Loadbalancing, kein Circuit-Breaker (nur im Router), kein
+    Context-Window-Fallback, keine Error-DB-Tabelle (Block 6.2).
+
 - 2026-06-11: 4.5a-Folge-Fix — Presidio erkannte für `de` KEINE Pattern-PII
   (IBAN/Email/Telefon), nur NER. Vom Live-Smoke gefunden, nicht von pytest.
   - URSACHE (per Diagnose, nicht geraten): wir hatten nur die NLP-Engine auf

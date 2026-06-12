@@ -214,12 +214,14 @@
 - [ ] `anonymized`-Flag echt setzen; Admin-UI fürs `pii_mode`-Setting
 - (in 4.5a verhält sich `strict` wie `sovereign`: Reroute statt Anonymisierung)
 
-### Task 4.6 — Fehlerbehandlung & Fallback
-- [ ] Provider-Timeout/Fehler abfangen, sauberer Error ans Frontend
-- [ ] Rate-Limit-Handling (Retry mit Backoff)
-- [ ] Fallback-Modell wenn Primär-Provider down (konfigurierbar)
-- [ ] Fehler werden geloggt (nicht im Audit, separates Error-Log)
-- **DoD:** Provider-Ausfall führt zu klarer Meldung, nicht zu Absturz
+### Task 4.6 — Fehlerbehandlung & Fallback ✅ (2026-06-12)
+- [x] Provider-Timeout/Fehler abfangen, sauberer Error ans Frontend (non-stream 503/400/502 mit fixen Texten ohne Key-Leak; stream → sse_error)
+- [x] Rate-Limit-Handling (Retry mit Backoff) (litellm `num_retries`+`timeout` per Modell, danach cross-model Fallback)
+- [x] Fallback-Modell wenn Primär-Provider down (konfigurierbar) (`fallback_models`, Default = Sovereign-Modelle) — **sovereignty-aware**: PII-souveräne Anfrage fällt NUR auf `sovereign_eligible` zurück, nie Nicht-EU; kein Ziel → 503
+- [x] Fehler werden geloggt (nicht im Audit, separates Error-Log) (`decyra.errors`-Logger; Hash-Kette bleibt rein; fehlgeschlagener Call = kein Audit-Event)
+- **DoD:** Provider-Ausfall führt zu klarer Meldung, nicht zu Absturz ✅ (95 Tests grün, npm build grün; Invarianten 1–4 getestet)
+- Streaming-Fallback nur vor dem ersten Chunk (danach festgelegt, Mid-Stream = 4.4); Status/Audit/Cost tragen das WIRKLICH genutzte Modell.
+- **Betriebs-Hinweis:** Sovereign-Resilienz erfordert **≥2 enabled `sovereign_eligible` Modelle** (sonst harte 503-Kante bei Sovereign-Ausfall — korrekt, aber bekannt halten).
 
 ---
 

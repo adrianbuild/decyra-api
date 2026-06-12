@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
-from app import chat, invitations, mail, pii
+from app import chat, invitations, llm_call, mail, pii
 from app.audit import verify_workspace_chain
 from app.auth import AuthenticatedUser, get_current_user
 from app.config import Settings, get_settings
@@ -21,6 +21,16 @@ from app.onboarding import ensure_workspace
 from app.verify_token import decode_verify_token
 
 logger = logging.getLogger("decyra.chat")
+
+# Client-facing error messages (Task 4.6) — fixed strings, NEVER the raw
+# provider exception (which can leak keys/internal detail).
+_PROVIDERS_UNAVAILABLE_MSG = (
+    "Kein Modell-Provider verfügbar. Bitte später erneut versuchen."
+)
+_BAD_REQUEST_MSG = (
+    "Anfrage konnte nicht verarbeitet werden (z. B. Kontextlänge überschritten)."
+)
+_PROVIDER_ERROR_MSG = "Modell-Provider-Fehler."
 
 
 @asynccontextmanager
@@ -322,6 +332,7 @@ def _resolve_effective_model(
 
 def _stream_turn(
     *,
+    candidates: list,
     kwargs: dict,
     open_txn: Callable[[], ContextManager[Connection]],
     ws: str,
@@ -329,26 +340,42 @@ def _stream_turn(
     existing_cid: str | None,
     new_messages: list[dict],
     llm_input: list[dict],
-    model: str,
-    provider: str,
-    cost_input: float,
-    cost_output: float,
     pii_detected: bool,
-    status_block: dict,
+    pii_check: str,
+    settings: Settings,
+    log_ctx: dict,
 ) -> Iterator[str]:
-    """Stream provider chunks to the client AND collect them; after the
-    stream, persist+audit the assembled answer in ONE short transaction
-    (the 4.3 write block, reused via ``chat.persist_stream_turn``). Three
-    exit paths share the same persist:
+    """Stream with sovereignty-aware fallback (4.6) + persist (4.4/4.5a).
 
-    - client abort (GeneratorExit): persist the collected partial, no yield
-      (yielding during GeneratorExit is illegal), then re-raise.
-    - provider abort (Exception): the partial was SEEN by the user, so it is
-      persisted+audited; the client gets an ``error`` event (no [DONE]).
-    - clean finish (else): persist the full answer, then the final chunk
-      (carrying the authoritative conversation_id) + [DONE].
+    The model is resolved BEFORE any client output via
+    ``open_stream_with_fallback`` (fallback only on a connect-time failure,
+    before the first chunk). Once a chunk has flowed the model is committed —
+    a mid-stream abort follows 4.4 (persist partial, error event, NO restart).
+    The status event therefore carries the REALLY used (possibly fallback)
+    model; persist/audit/cost use it too.
     """
     collected: list = []
+
+    try:
+        used_model, used_row, first_chunk, it = llm_call.open_stream_with_fallback(
+            candidates, kwargs, settings, log_ctx=log_ctx
+        )
+    except llm_call.ProvidersUnavailable:
+        yield chat.sse_error(_PROVIDERS_UNAVAILABLE_MSG, existing_cid)
+        return
+    except litellm.BadRequestError:
+        yield chat.sse_error(_BAD_REQUEST_MSG, existing_cid)
+        return
+    except litellm.APIError:
+        yield chat.sse_error(_PROVIDER_ERROR_MSG, existing_cid)
+        return
+
+    status_block = chat.pii_status(
+        pii_detected=pii_detected,
+        pii_check=pii_check,
+        routed_to=used_row.provider,
+        effective_model=used_model,
+    )
 
     def _persist() -> str | None:
         with open_txn() as db_write:
@@ -361,21 +388,20 @@ def _stream_turn(
                 new_messages,
                 collected,
                 llm_input,
-                model=model,
-                provider=provider,
-                cost_input=cost_input,
-                cost_output=cost_output,
+                model=used_model,
+                provider=used_row.provider,
+                cost_input=used_row.cost_input,
+                cost_output=used_row.cost_output,
                 pii_detected=pii_detected,
             )
 
-    # First event: the PII/routing status (decision is known pre-stream), so
-    # the client can show the notice before any token arrives.
+    # First event: the PII/routing status (now carrying the real model).
     yield chat.sse_status(status_block)
     try:
-        stream = litellm.completion(
-            **kwargs, stream=True, stream_options={"include_usage": True}
-        )
-        for chunk in stream:
+        if first_chunk is not None:
+            collected.append(first_chunk)
+            yield chat.sse_chunk(first_chunk, existing_cid)
+        for chunk in it:
             collected.append(chunk)
             yield chat.sse_chunk(chunk, existing_cid)
     except GeneratorExit:
@@ -386,7 +412,7 @@ def _stream_turn(
         yield chat.sse_error(str(e), cid or existing_cid)
         return
     cid = _persist()
-    yield chat.sse_final(cid or existing_cid, model)
+    yield chat.sse_final(cid or existing_cid, used_model)
     yield chat.sse_done()
 
 
@@ -480,23 +506,23 @@ def chat_completions(
                 "PII detected — reroute %s -> %s (ws=%s)",
                 payload.model, effective_model, ws,
             )
-    status_block = chat.pii_status(
-        pii_detected=outcome.detected,
-        pii_check=outcome.status,
-        routed_to=eff_row.provider,
-        effective_model=effective_model,
+    # Sovereignty-aware fallback candidates (Task 4.6). kwargs has NO model —
+    # the executor sets it per candidate.
+    candidates = llm_call.build_candidates(
+        db_read, effective_model, eff_row, settings
     )
-
-    kwargs: dict = {"model": effective_model, "messages": llm_input}
+    log_ctx = {"workspace_id": ws, "user_id": user.user_id}
+    kwargs: dict = {"messages": llm_input}
     if payload.temperature is not None:
         kwargs["temperature"] = payload.temperature
     if payload.max_tokens is not None:
         kwargs["max_tokens"] = payload.max_tokens
 
-    # --- Streaming path (Task 4.4 + 4.5a) ------------------------------
+    # --- Streaming path (Task 4.4 + 4.5a + 4.6) ------------------------
     if payload.stream:
         return StreamingResponse(
             _stream_turn(
+                candidates=candidates,
                 kwargs=kwargs,
                 open_txn=open_txn,
                 ws=ws,
@@ -504,24 +530,40 @@ def chat_completions(
                 existing_cid=existing_cid,
                 new_messages=new_messages,
                 llm_input=llm_input,
-                model=effective_model,
-                provider=eff_row.provider,
-                cost_input=eff_row.cost_input,
-                cost_output=eff_row.cost_output,
                 pii_detected=outcome.detected,
-                status_block=status_block,
+                pii_check=outcome.status,
+                settings=settings,
+                log_ctx=log_ctx,
             ),
             media_type="text/event-stream",
         )
 
-    # --- Non-streaming path (4.3 write block; effective model) ---------
-    resp = litellm.completion(**kwargs)
+    # --- Non-streaming path (4.6 fallback; effective/used model) -------
+    try:
+        used_model, used_row, resp = llm_call.complete_with_fallback(
+            candidates, kwargs, settings, log_ctx=log_ctx
+        )
+    except llm_call.ProvidersUnavailable:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, detail=_PROVIDERS_UNAVAILABLE_MSG
+        )
+    except litellm.BadRequestError:  # incl. ContextWindowExceededError
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=_BAD_REQUEST_MSG)
+    except litellm.APIError:  # auth/permission/notfound/…
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=_PROVIDER_ERROR_MSG)
+
     assistant_content = resp.choices[0].message.content or ""
     cost = chat.compute_cost(
         resp.usage.prompt_tokens,
         resp.usage.completion_tokens,
-        eff_row.cost_input,
-        eff_row.cost_output,
+        used_row.cost_input,
+        used_row.cost_output,
+    )
+    status_block = chat.pii_status(
+        pii_detected=outcome.detected,
+        pii_check=outcome.status,
+        routed_to=used_row.provider,
+        effective_model=used_model,
     )
 
     # messages.workspace_id is always ws (the conversation's workspace),
@@ -543,7 +585,7 @@ def chat_completions(
             ws,
             "assistant",
             assistant_content,
-            model=effective_model,
+            model=used_model,
             prompt_tokens=resp.usage.prompt_tokens,
             completion_tokens=resp.usage.completion_tokens,
             cost=cost,
@@ -553,15 +595,13 @@ def chat_completions(
             db_write,
             ws,
             user.user_id,
-            effective_model,
+            used_model,
             chat.audit_request_text(new_messages),
             assistant_content,
-            eff_row.provider,
+            used_row.provider,
             outcome.detected,
         )
-    return chat.build_openai_response(
-        resp, effective_model, cid, status_block
-    )
+    return chat.build_openai_response(resp, used_model, cid, status_block)
 
 
 @app.get("/conversations")
