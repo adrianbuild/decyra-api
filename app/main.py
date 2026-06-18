@@ -565,45 +565,74 @@ def chat_completions(
     # Explicit per-chat override to persist onto the conversation (or None).
     conv_pii_mode = payload.pii_mode
 
+    # Two DISTINCT PII operations over the same input, deliberately decoupled:
+    #  * Sovereign reroute DECISION is based on USER-authored text only. Model
+    #    output (e.g. a URL like "mobile.de" in an answer, scored 0.5 by
+    #    Presidio's URL recognizer) must NOT trigger an EU reroute — the
+    #    protected object is the user's input (see PROGRESS security block).
+    #  * Strict ANONYMISATION still covers the FULL input (history incl.
+    #    assistant), so any PII that would reach the cloud is masked — otherwise
+    #    strict would leak assistant-originated PII (Invariant 1/2).
     full_text = "\n".join(m["content"] for m in llm_input if m.get("content"))
-    outcome = pii.contains_pii(full_text, settings)
+    user_text = "\n".join(
+        m["content"]
+        for m in llm_input
+        if m.get("role") == "user" and m.get("content")
+    )
 
     anonymizer = None
     anonymized = False
     llm_input_for_provider = llm_input
     audit_request = chat.audit_request_text(new_messages)
 
-    if mode == "strict" and outcome.detected:
-        # Anonymise the WHOLE input, keep the chosen model, send only
-        # placeholders (Invariant 2). If Presidio is unavailable mid-anonymise
-        # we cannot guarantee a clean mask -> fail-safe sovereign reroute rather
-        # than risk leaking un-masked PII.
-        try:
-            llm_input_for_provider, anonymizer = pii.anonymize_messages(
-                llm_input, settings
-            )
-            anonymized = True
-            effective_model, eff_row = payload.model, model_row  # no reroute
-            anon_new = llm_input_for_provider[len(llm_input) - len(new_messages) :]
-            audit_request = chat.audit_request_text(anon_new)
-        except Exception:  # noqa: BLE001 — Presidio down => fail-safe reroute
-            anonymizer = None
-            anonymized = False
-            llm_input_for_provider = llm_input
-            logger.warning(
-                "strict anonymisation unavailable — fail-safe sovereign "
-                "reroute (ws=%s)", ws,
-            )
+    if mode == "strict":
+        # Detect over the FULL input (leak-safety), then anonymise the whole
+        # input in place, keep the chosen model, send only placeholders
+        # (Invariant 2). `outcome` (full-input) drives pii_detected/pii_check.
+        outcome = pii.contains_pii(full_text, settings)
+        if outcome.detected:
+            # If Presidio is unavailable mid-anonymise we cannot guarantee a
+            # clean mask -> fail-safe sovereign reroute rather than risk leaking.
+            try:
+                llm_input_for_provider, anonymizer = pii.anonymize_messages(
+                    llm_input, settings
+                )
+                anonymized = True
+                effective_model, eff_row = payload.model, model_row  # no reroute
+                anon_new = llm_input_for_provider[len(llm_input) - len(new_messages) :]
+                audit_request = chat.audit_request_text(anon_new)
+            except Exception:  # noqa: BLE001 — Presidio down => fail-safe reroute
+                anonymizer = None
+                anonymized = False
+                llm_input_for_provider = llm_input
+                logger.warning(
+                    "strict anonymisation unavailable — fail-safe sovereign "
+                    "reroute (ws=%s)", ws,
+                )
+                effective_model, eff_row = _resolve_effective_model(
+                    db_read,
+                    chosen_model=payload.model,
+                    chosen_row=model_row,
+                    outcome=pii.PiiOutcome("unavailable", False),
+                    settings=settings,
+                )
+        else:
+            # Strict without detectable PII, or an unavailable check: the 4.5a
+            # logic (unavailable fail-safe reroutes; clean keeps the chosen model).
             effective_model, eff_row = _resolve_effective_model(
                 db_read,
                 chosen_model=payload.model,
                 chosen_row=model_row,
-                outcome=pii.PiiOutcome("unavailable", False),
+                outcome=outcome,
                 settings=settings,
             )
     else:
-        # Sovereign mode, strict-without-PII, or an unavailable check: the 4.5a
-        # reroute logic (reroute only when protection is needed).
+        # Sovereign: the reroute decision is based on USER text only, so model
+        # output cannot force an EU reroute. `outcome` (user-text) drives
+        # pii_detected/pii_check and the 4.5a reroute (only when protection is
+        # needed). User PII in stored history is still in user_text -> the
+        # one-way ratchet is preserved.
+        outcome = pii.contains_pii(user_text, settings)
         effective_model, eff_row = _resolve_effective_model(
             db_read,
             chosen_model=payload.model,

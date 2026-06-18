@@ -68,6 +68,25 @@ Eigenschaften, vor Pilot bewerten):
   Response sichtbar. Kandidat: `pii_check`-Status-Feld in `audit_events`.
 - **`resp.model` wird nicht mitgeloggt** (aus 4.2-Diagnose) — Audit-Härtung-
   Kandidat zusammen mit dem `completed`-Flag aus 4.4.
+- **PII-Routing-Entscheidung basiert auf User-Autorentext; Assistant-Output
+  triggert kein Reroute.** Begründung: Schutzgegenstand ist die Nutzer-Eingabe.
+  Modell-generierte Domains/Begriffe (z. B. `mobile.de`) lösten sonst via
+  Presidio-`URL` (Score 0.5 > Threshold 0.4) einen Falsch-Positiv-Reroute aus
+  und kippten die Einbahn-Ratsche (live gefunden). Saubere Trennung in
+  `app/main.py`: *Routing-Entscheidung (Sovereign)* = Scan über `user_text`
+  (nur `role=='user'`); *Anonymisierung (Strict)* = weiterhin über den GESAMTEN
+  Input (`anonymize_messages(llm_input)`, inkl. Assistant) → Assistant-seitige
+  PII wird vor Versand maskiert, kein Strict-Leck. `pii_detected`/`pii_check`
+  spiegeln je Modus die jeweils relevante Quelle (Sovereign: user_text; Strict:
+  full_text). `pii_detected` ist NICHT Teil des gehashten `canonical_string`
+  → Kette unberührt. Wächter: `test_assistant_pii_does_not_reroute_sovereign`
+  (kein Reroute) + `test_strict_anonymizes_assistant_pii_no_leak` (Maskierung
+  bleibt).
+  - **Bewusste Annahme/Grenze (Sovereign):** Von einem Modell ausgegebene PII
+    (inkl. künftiger RAG-Quellen, Block 5) erzwingt im Sovereign-Modus KEINEN
+    EU-Reroute. Akzeptiert, weil der Schutzgegenstand die Nutzer-Eingabe ist —
+    **bei RAG neu zu bewerten** (Dokumente können PII einschleusen, die nie im
+    User-Text stand).
 
 NEU offen aus 2.3:
 

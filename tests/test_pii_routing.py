@@ -172,6 +172,45 @@ async def test_invariant1_pii_only_in_history_still_reroutes(
 
 
 @pytest.mark.asyncio
+async def test_assistant_pii_does_not_reroute_sovereign(
+    client, db, make_token, stub_pii
+) -> None:
+    """Guard: the sovereign reroute DECISION scans USER-authored text only.
+    A model-generated answer that contains e.g. 'mobile.de' (Presidio tags it
+    URL, score 0.5 > threshold) must NOT flip the conversation to an EU model.
+    Protected object = user input (see PROGRESS security block)."""
+    _org, ws = seed_org_with_owner(db, USER_A, "a@firma.de")
+    _seed_model(db, CHOSEN)
+    _seed_sovereign(db)
+    cid = db.execute(
+        text("INSERT INTO conversations (workspace_id, user_id, title) "
+             "VALUES (:w, :u, 't') RETURNING id"),
+        {"w": ws, "u": USER_A},
+    ).scalar_one()
+    # PII-like token sits ONLY in a prior ASSISTANT answer (model output),
+    # never typed by the user. The needle would match if assistant text were
+    # scanned -> proves the scan is user-text-only.
+    db.execute(
+        text("INSERT INTO messages (conversation_id, workspace_id, role, content) "
+             "VALUES (:c, :w, 'assistant', 'Schau auf mobile.de für Preise.')"),
+        {"c": cid, "w": ws},
+    )
+    stub_pii.state["needle"] = "mobile.de"  # force stays None -> substring match
+    token = make_token(sub=USER_A, email="a@firma.de")
+
+    r = await client.post(
+        "/v1/chat/completions", headers=_auth(token),
+        json=_body(token, CHOSEN, content="harmlose Folgefrage",
+                   conversation_id=str(cid)),
+    )
+    assert r.status_code == 200
+    d = r.json()["decyra"]
+    assert d["effective_model"] == CHOSEN  # NO reroute
+    assert d["routed_to"] == "openai"
+    assert d["pii_detected"] is False
+
+
+@pytest.mark.asyncio
 async def test_invariant2_presidio_unavailable_failsafe_reroutes(
     client, db, make_token, stub_pii
 ) -> None:

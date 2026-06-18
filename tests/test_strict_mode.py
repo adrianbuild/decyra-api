@@ -183,6 +183,47 @@ async def test_strict_ratchet_anonymizes_history_too(
 
 
 @pytest.mark.asyncio
+async def test_strict_anonymizes_assistant_pii_no_leak(
+    client, db, make_token, stub_pii, stub_analyze, stub_llm
+) -> None:
+    """Guard: strict ANONYMISATION covers the FULL input (incl. assistant
+    history), even though the sovereign reroute decision is user-text-only. PII
+    sitting only in a prior assistant answer must NOT leak un-masked to the
+    cloud. Detection is needle-based (not force), so this also proves strict
+    scans the full input: the needle sits only in the assistant message; a
+    user-text-only scan would miss it and the PII would leak (test fails)."""
+    _org, ws = seed_org_with_owner(db, USER_A, "a@firma.de")
+    _seed_model(db, CHOSEN)
+    _seed_sovereign(db)
+    stub_pii.state["needle"] = PII
+    stub_analyze.state["spans_for"] = {PII: "PERSON"}
+    cid = db.execute(
+        text("INSERT INTO conversations (workspace_id, user_id, title, pii_mode) "
+             "VALUES (:w, :u, 't', 'strict') RETURNING id"),
+        {"w": ws, "u": USER_A},
+    ).scalar_one()
+    db.execute(
+        text("INSERT INTO messages (conversation_id, workspace_id, role, content) "
+             f"VALUES (:c, :w, 'assistant', 'Aus dem Bericht: {PII} ist Kunde.')"),
+        {"c": cid, "w": ws},
+    )
+    token = make_token(sub=USER_A, email="a@firma.de")
+
+    r = await client.post(
+        "/v1/chat/completions", headers=_auth(token),
+        json=_body(CHOSEN, content="harmlose Folgefrage",
+                   conversation_id=str(cid), pii_mode="strict"),
+    )
+    assert r.status_code == 200
+    d = r.json()["decyra"]
+    assert d["anonymized"] is True
+    assert d["effective_model"] == CHOSEN  # strict masks in place, no reroute
+    sent = _provider_input(stub_llm)
+    assert PII not in sent  # assistant-originated PII masked -> no leak
+    assert "[[DCY_PERSON_0]]" in sent
+
+
+@pytest.mark.asyncio
 async def test_strict_without_pii_sends_original_no_anonymize(
     client, db, make_token, stub_pii, stub_llm
 ) -> None:
