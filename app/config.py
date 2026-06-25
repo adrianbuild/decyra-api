@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     # Per-model transient retry with backoff (passed to litellm `num_retries`).
     num_retries: int = 2
 
+    # Document storage (Task 5.1). Local filesystem for now (object storage
+    # later). Raw uploaded files live here under {workspace_id}/{uuid}{ext};
+    # point DOCUMENT_STORAGE_DIR OUTSIDE the repo in production.
+    document_storage_dir: str = "./var/documents"
+    # Hard server-side upload cap (enforced by counting streamed bytes, never
+    # by the spoofable Content-Length header).
+    max_upload_bytes: int = 25 * 1024 * 1024  # 25 MiB
+
 
 @lru_cache
 def get_settings() -> Settings:

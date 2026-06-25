@@ -3,7 +3,10 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 4 — Routing/Chat/PII**: 4.5b (Strict-Modus) abgeschlossen. **Block 4 KOMPLETT fertig** (4.1–4.6 inkl. 4.5a+4.5b). Nächster Block: 5 (RAG). **127 Tests grün**, `npm run build` grün, Strict-Live-Smoke (nur Platzhalter an Anthropic) bestanden.
+**Block 5 — RAG**: 5.1 (Dokument-Upload & Text-Extraktion) abgeschlossen.
+**143 Tests grün** (+14 in test_documents.py). Nächster Task: 5.2 (Chunking &
+Embeddings). Live-Smoke (echtes PDF/DOCX/TXT-Upload durch User) ausstehend.
+**Block 4 davor KOMPLETT** (4.1–4.6 inkl. 4.5a+4.5b).
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
@@ -11,7 +14,7 @@
 - [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [x] 2.2c decyra_app-Switch + RLS scharf; [x] 2.3 Einladungen & Rollen; [ ] 2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
 - [x] Block 4 — Routing/Chat/PII ([x] 4.1 Phase A; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [x] 4.4 Streaming; [x] 4.5a PII-Erkennung + Sovereign-Routing; [x] 4.5b Strict-Modus; [x] 4.6 Fehler/Fallback)
-- [ ] Block 5 — RAG (5.1 Upload, 5.2 Embeddings, 5.3 Retrieval)
+- [~] Block 5 — RAG ([x] 5.1 Upload & Text-Extraktion; [ ] 5.2 Embeddings; [ ] 5.3 Retrieval)
 - [ ] Block 5B — Chat-Features (5B.1 Datei-Upload, 5B.2 Datenanalyse+Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects)
 - [ ] Block 6 — Frontend (6.1 Chat, 6.2 Dashboard Logs, 6.3 Dashboard Verwaltung)
 - [ ] Block 7 — Extension (7.1 Grundgerüst, 7.2 ChatGPT-Integration)
@@ -87,6 +90,15 @@ Eigenschaften, vor Pilot bewerten):
     EU-Reroute. Akzeptiert, weil der Schutzgegenstand die Nutzer-Eingabe ist —
     **bei RAG neu zu bewerten** (Dokumente können PII einschleusen, die nie im
     User-Text stand).
+- **Dokument-Quotas (5.1, vertagt — vor Pilot bewerten):** 5.1 erzwingt ein
+  Pro-Datei-Größenlimit (25 MiB, serverseitig per Stream-Byte-Zähler), aber
+  **keine** Pro-Workspace-Anzahl-/Gesamtgröße-Grenze. DoS durch viele kleine
+  Uploads ist damit offen. Vor Pilot: Quota pro Workspace (Anzahl + Summe
+  Bytes) ergänzen. Scope bewusst aus 5.1 herausgehalten.
+- **Dokument-Text = potenzielle PII (5.1):** der extrahierte Text liegt in
+  `documents.extracted_text` (RLS-geschützt, löschbar) — wie `messages`. In 5.1
+  geht er an KEIN LLM. 5.2/5.3 MÜSSEN ihn vor dem Cloud-Versand durch die
+  Sovereign/Strict-Logik schicken (siehe Tür/Grenze im 5.1-Session-Eintrag).
 
 NEU offen aus 2.3:
 
@@ -132,6 +144,66 @@ Die drei ursprünglichen Punkte:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-25: **Task 5.1 abgeschlossen — Dokument-Upload & Text-Extraktion**
+  (decyra-api). PDF/DOCX/TXT hochladen → Text extrahiert → Rohdatei lokal +
+  Metadaten/Text in der (RLS'd) `documents`-Tabelle → listen → löschen.
+  **127 → 143 Tests grün** (+14 in test_documents.py), DB-Container hoch.
+  - **`documents` war schon da** (Initial-Schema) mit RLS (`documents_isolation`,
+    FORCE) + decyra_app-Grants (S/I/U/D). 5.1 = **ALTER**, kein CREATE.
+    Migration `a7c1e9d4b2f8` (down_revision `f1a2b3c4d5e6`): ADD `storage_key`,
+    `mime_type`, `size_bytes`, `extracted_text`, `extraction_status`
+    (CHECK 'ok'/'no_text'), alle NOT NULL (temp server_default → gedroppt).
+    Neue Spalten erben Policy + Grants automatisch.
+  - **`document_events` (neu):** unveränderlicher Tombstone-Log, getrennt von
+    der LLM-Hash-Chain. Spalten workspace_id/document_id/filename/event_type
+    ('deleted')/actor_user_id/created_at — **ohne Inhalt** (DSGVO: gelöschter
+    Text ist wirklich weg). Eigene RLS-Policy + Grant nur SELECT,INSERT
+    (append-only → Tombstones immutabel).
+  - **`app/storage.py`:** Key nur aus UUIDs (`{ws}/{doc_id}{ext}`), nie aus
+    User-Dateiname; atomar (temp + os.replace); `_resolve_within` lehnt Pfade
+    ab, die das base-dir verlassen (Traversal strukturell unmöglich). Config
+    `document_storage_dir` (Default `./var/documents`, gitignored;
+    DOCUMENT_STORAGE_DIR außerhalb Repo in Prod), `max_upload_bytes` (25 MiB).
+  - **`app/documents.py`:** `sniff_mime` ist **inhaltsbasiert & autoritativ**
+    (filename/Content-Type werden nie vertraut). PDF via Magic-Bytes; **DOCX
+    hart** via `[Content_Types].xml` + `word/document.xml` (ein nacktes/fremdes
+    ZIP als .docx wird abgelehnt — filetype trennt docx von zip bereits, der
+    Struktur-Check ist die zusätzliche Schärfung); TXT nur bei gültigem UTF-8,
+    sonst 415. `extract_text` → (text, status); leerer Text (gescanntes PDF) →
+    `no_text` (gespeichert, **nicht** abgelehnt; 5.2 überspringt no_text, OCR
+    später). Korrupt → 422. `sanitize_filename` nur fürs Anzeige-Feld.
+  - **Endpoints (`main.py`):** `POST /documents` (Multipart) — **Größenlimit
+    serverseitig durch GEZÄHLTE Stream-Bytes** (Content-Length wird nie gelesen)
+    → 413; sniff → 415; extract → 422; Datei FIRST, dann DB-Insert (sichere
+    Orphan-Richtung: Datei ohne Zeile = unerreichbar; Insert-Fehler → Datei
+    best-effort entfernt). `GET /documents` (RLS-scoped, kein Text in der Liste).
+    `DELETE /documents/{id}`: RLS-Select → 404 wenn fremd (kein Cross-Tenant-
+    Leak); Tombstone + Row-Delete in einer Txn; Datei-Unlink **nach** Commit.
+    Workspace via `resolve_membership` → `set_workspace_context`.
+  - **Tests (+14):** TXT/PDF/DOCX-Extraktion; 401; **Sicherheit** (Binär als
+    .pdf/.txt → 415, nichts geschrieben; nacktes ZIP als .docx → 415);
+    **Größenlimit** (Stream-Byte-Zähler → 413); **no_text** (gescanntes PDF →
+    gespeichert mit Status); korruptes PDF → 422; Dateiname sanitisiert/Key aus
+    UUID; **Mandanten-Isolation unter echter `decyra_app`-Rolle** (B sieht/
+    löscht A's Dokument NICHT); Lösch-Test (Datei + Text weg, Tombstone bleibt).
+  - **DEBUG (Diagnose vor Fix, 3 rote):** (1+2) `test_rls`/`test_schema` inserten
+    Bare-`documents`-Zeilen → die neuen NOT-NULL-Spalten brachen sie → Inserts
+    um die Spalten ergänzt (RLS-Aussage unverändert; der Cross-WS-Insert trifft
+    weiter die WITH-CHECK-Policy, nicht NOT NULL). (3) `test_delete_cross_
+    workspace_forbidden` war ein **Test-Artefakt**: die geteilte Per-Test-
+    Connection blieb in B's RLS-Kontext (decyra_app + wsB), ein roher Count
+    versteckte A's Zeile → auf Assertion via A's eigenes GET umgestellt. Kein
+    App-Bug.
+  - **PII-GRENZE (dokumentiert, Tür für 5.2/5.3):** `extracted_text` ist echte
+    potenzielle PII in einer RLS-geschützten, löschbaren Tabelle (wie `messages`
+    in 4.5b). 5.1 speichert nur — **kein LLM-Call, also noch kein PII-Routing.**
+    Sobald 5.2/5.3 den Dokumenttext in den Chat-Kontext ziehen, MUSS er durch
+    dieselbe Sovereign/Strict-Logik wie User-Input (WORKPLAN-5.3-Punkt +
+    „bei RAG neu bewerten" aus dem 4.5-Fix). 5.1 öffnet die Tür, 5.2/5.3
+    schließen sie. Tombstone enthält bewusst keinen Inhalt.
+  - **Scope (bewusst ausgelassen):** kein Chunking/Embeddings/Retrieval (5.2/5.3),
+    kein Download-Endpoint, keine OCR, **keine Quotas** (Pre-Pilot-Hinweis unten).
+    Upload-Provenienz steckt in `documents.uploaded_by`/`created_at`.
 - 2026-06-12: **Task 4.5b abgeschlossen — Strict-Modus** (anonymisieren →
   Cloud → de-anonymisieren). 95 → **127 Tests grün**, `npm run build` grün,
   Live-Smoke gegen echtes Presidio + echte Anthropic-Cloud bestanden.

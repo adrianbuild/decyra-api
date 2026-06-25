@@ -2,17 +2,25 @@ import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from typing import Callable, ContextManager
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import litellm
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
-from app import chat, invitations, llm_call, mail, pii
+from app import chat, documents, invitations, llm_call, mail, pii, storage
 from app.audit import verify_workspace_chain
 from app.auth import AuthenticatedUser, get_current_user
 from app.config import Settings, get_settings
@@ -203,6 +211,175 @@ def onboarding(
         "workspace_name": result.workspace_name,
         "created": result.created,
     }
+
+
+# --- Documents (Task 5.1: upload + extraction + management) ------------
+
+_UPLOAD_CHUNK = 1024 * 1024  # 1 MiB read window
+
+
+class DocumentOut(BaseModel):
+    id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    extraction_status: str
+    created_at: str
+
+
+def _require_workspace(db: Connection, user: AuthenticatedUser) -> str:
+    """Resolve the caller's workspace (RLS-bypassed SECURITY DEFINER lookup);
+    403 if the user has no membership yet."""
+    member = invitations.resolve_membership(db, user.user_id)
+    if member is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, detail="no workspace membership"
+        )
+    return member.workspace_id
+
+
+@app.post("/documents", response_model=DocumentOut)
+async def upload_document(
+    file: UploadFile = File(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db_read: Connection = Depends(get_db),
+    open_txn: Callable[[], ContextManager[Connection]] = Depends(get_write_txn),
+    settings: Settings = Depends(get_settings),
+) -> DocumentOut:
+    """Upload a PDF/DOCX/TXT: validate by CONTENT (not filename), extract text,
+    store the raw file locally + metadata/text in the (RLS'd) documents table."""
+    ws = _require_workspace(db_read, user)
+
+    # Size limit enforced by COUNTING streamed bytes — Content-Length is
+    # spoofable and deliberately never consulted.
+    buf = bytearray()
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > settings.max_upload_bytes:
+            raise HTTPException(
+                status.HTTP_413_CONTENT_TOO_LARGE, detail="file too large"
+            )
+    data = bytes(buf)
+    if not data:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="empty file")
+
+    try:
+        mime = documents.sniff_mime(data)
+    except documents.UnsupportedType:
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="unsupported file type (allowed: PDF, DOCX, TXT)",
+        )
+    try:
+        extracted_text, extraction_status = documents.extract_text(mime, data)
+    except documents.ExtractionError:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="file could not be processed (corrupt or unreadable)",
+        )
+
+    doc_id = str(uuid4())
+    key = storage.build_storage_key(ws, doc_id, documents.EXT[mime])
+    display_name = documents.sanitize_filename(file.filename)
+
+    # File FIRST, then the DB row. The only possible orphan is a file with no
+    # row (unreachable, harmless); a row pointing at a missing file is avoided.
+    storage.write_document(settings.document_storage_dir, key, data)
+    try:
+        with open_txn() as db:
+            set_workspace_context(db, ws)
+            row = db.execute(
+                text(
+                    "INSERT INTO documents "
+                    "(id, workspace_id, filename, uploaded_by, mime_type, "
+                    " size_bytes, storage_key, extracted_text, extraction_status) "
+                    "VALUES (:id, :ws, :fn, :uid, :mime, :size, :key, :txt, :st) "
+                    "RETURNING created_at"
+                ),
+                {
+                    "id": doc_id, "ws": ws, "fn": display_name,
+                    "uid": user.user_id, "mime": mime, "size": len(data),
+                    "key": key, "txt": extracted_text, "st": extraction_status,
+                },
+            ).one()
+    except Exception:
+        # A failed insert must leave nothing behind: remove the file we wrote.
+        storage.delete_document(settings.document_storage_dir, key)
+        raise
+
+    return DocumentOut(
+        id=doc_id, filename=display_name, mime_type=mime,
+        size_bytes=len(data), extraction_status=extraction_status,
+        created_at=row.created_at.isoformat(),
+    )
+
+
+@app.get("/documents", response_model=list[DocumentOut])
+def list_documents(
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: Connection = Depends(get_db),
+) -> list[DocumentOut]:
+    """List the caller's workspace documents (RLS-scoped; no text in the list)."""
+    ws = _require_workspace(db, user)
+    set_workspace_context(db, ws)
+    rows = db.execute(
+        text(
+            "SELECT id, filename, mime_type, size_bytes, extraction_status, "
+            "created_at FROM documents ORDER BY created_at DESC"
+        )
+    ).all()
+    return [
+        DocumentOut(
+            id=str(r.id), filename=r.filename, mime_type=r.mime_type,
+            size_bytes=r.size_bytes, extraction_status=r.extraction_status,
+            created_at=r.created_at.isoformat(),
+        )
+        for r in rows
+    ]
+
+
+@app.delete("/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_document(
+    document_id: UUID,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db_read: Connection = Depends(get_db),
+    open_txn: Callable[[], ContextManager[Connection]] = Depends(get_write_txn),
+    settings: Settings = Depends(get_settings),
+) -> Response:
+    """Hard-delete a document (row + raw file) + an immutable tombstone. A
+    foreign-workspace id is invisible under RLS -> 404 (no cross-tenant leak)."""
+    ws = _require_workspace(db_read, user)
+    with open_txn() as db:
+        set_workspace_context(db, ws)
+        row = db.execute(
+            text("SELECT storage_key, filename FROM documents WHERE id = :id"),
+            {"id": str(document_id)},
+        ).one_or_none()
+        if row is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail="document not found"
+            )
+        db.execute(
+            text(
+                "INSERT INTO document_events "
+                "(workspace_id, document_id, filename, event_type, actor_user_id) "
+                "VALUES (:ws, :doc, :fn, 'deleted', :uid)"
+            ),
+            {"ws": ws, "doc": str(document_id), "fn": row.filename,
+             "uid": user.user_id},
+        )
+        db.execute(
+            text("DELETE FROM documents WHERE id = :id"), {"id": str(document_id)}
+        )
+        storage_key = row.storage_key
+    # Committed on the `with` exit (the DB row is the source of truth). Unlink
+    # the file AFTER commit; a leftover file (if unlink fails) is the harmless
+    # orphan direction.
+    storage.delete_document(settings.document_storage_dir, storage_key)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 class InvitationCreate(BaseModel):

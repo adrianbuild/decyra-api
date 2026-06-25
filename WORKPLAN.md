@@ -234,13 +234,16 @@
 
 ## TASK-BLOCK 5 — Wissensdatenbank (RAG)
 
-### Task 5.1 — Dokument-Upload & Text-Extraktion
-- [ ] POST /documents (Multipart-Upload)
-- [ ] Formate: PDF (pdfplumber), Word (python-docx), TXT
-- [ ] Datei-Validierung (Größe, Typ)
-- [ ] Metadaten in documents-Tabelle, Datei in Object-Storage/lokal
-- [ ] Endpoint: Dokumente des Workspace auflisten, löschen
-- **DoD:** PDF/Word/TXT hochladen, Text extrahiert, gelistet
+### Task 5.1 — Dokument-Upload & Text-Extraktion ✅
+- [x] POST /documents (Multipart-Upload)
+- [x] Formate: PDF (pdfplumber), Word (python-docx), TXT
+- [x] Datei-Validierung (Größe, Typ) — **inhaltsbasiertes Sniffing** (filetype + DOCX-Struktur-Check), nicht Endung/Content-Type; **serverseitiges Größenlimit per Stream-Byte-Zähler** (kein Content-Length)
+- [x] Metadaten in documents-Tabelle (ALTER: storage_key/mime_type/size_bytes/extracted_text/extraction_status), Datei lokal unter `{workspace_id}/{uuid}{ext}` (Object-Storage später)
+- [x] Endpoint: Dokumente des Workspace auflisten, einzelnes löschen (Hard-Delete Datei+Text + unveränderlicher `document_events`-Tombstone)
+- **DoD:** PDF/Word/TXT hochladen, Text extrahiert, gelistet ✅ (143 Tests grün; Mandanten-Isolation unter echter RLS-Rolle + Upload-Sicherheit getestet; Migration `a7c1e9d4b2f8`)
+- **Mandanten-Isolation:** `documents`/`document_events` RLS-geschützt (workspace-GUC); Datei-Zugriff immer über die RLS-geprüfte DB-Zeile, Storage-Key aus UUIDs (kein Traversal).
+- **PII-GRENZE für 5.2/5.3:** `extracted_text` ist potenzielle PII (RLS, löschbar, wie `messages`). 5.1 speichert nur — kein LLM, kein Routing. **5.2/5.3 MÜSSEN** Dokumenttext durch dieselbe Sovereign/Strict-Logik wie User-Input schicken (siehe 5.3-Punkt „PII-Check auch auf RAG-Kontext" + „bei RAG neu bewerten"). 5.1 öffnet die Tür, 5.2/5.3 schließen sie.
+- *Offen (vor Pilot): Pro-Workspace-Quota (Anzahl/Gesamtgröße) gegen Upload-DoS — bewusst aus 5.1 herausgehalten.*
 
 ### Task 5.2 — Chunking & Embeddings
 - [ ] Chunking: ~500 Tokens mit ~50 Token Overlap
