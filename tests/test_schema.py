@@ -131,8 +131,9 @@ def test_workspace_id_isolation_via_rls(db: Connection) -> None:
     )
     db.execute(
         text(
-            "INSERT INTO documents (workspace_id, filename, uploaded_by) "
-            "VALUES (:w, 'a.pdf', :u)"
+            "INSERT INTO documents (workspace_id, filename, uploaded_by, "
+            "storage_key, mime_type, size_bytes, extracted_text, extraction_status) "
+            "VALUES (:w, 'a.pdf', :u, 'k-a', 'application/pdf', 0, '', 'ok')"
         ),
         {"w": ws_a, "u": user_id},
     )
@@ -147,8 +148,9 @@ def test_workspace_id_isolation_via_rls(db: Connection) -> None:
     )
     db.execute(
         text(
-            "INSERT INTO documents (workspace_id, filename, uploaded_by) "
-            "VALUES (:w, 'b.pdf', :u)"
+            "INSERT INTO documents (workspace_id, filename, uploaded_by, "
+            "storage_key, mime_type, size_bytes, extracted_text, extraction_status) "
+            "VALUES (:w, 'b.pdf', :u, 'k-b', 'application/pdf', 0, '', 'ok')"
         ),
         {"w": ws_b, "u": user_id},
     )

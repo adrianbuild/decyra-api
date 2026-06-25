@@ -48,8 +48,9 @@ def _seed_two_workspaces(db: Connection) -> tuple[str, str, str]:
     for ws, fn in ((ws_a, "a.pdf"), (ws_b, "b.pdf")):
         db.execute(
             text(
-                "INSERT INTO documents (workspace_id, filename, uploaded_by) "
-                "VALUES (:w, :fn, :u)"
+                "INSERT INTO documents (workspace_id, filename, uploaded_by, "
+                "storage_key, mime_type, size_bytes, extracted_text, extraction_status) "
+                "VALUES (:w, :fn, :u, :fn, 'application/pdf', 0, '', 'ok')"
             ),
             {"w": ws, "fn": fn, "u": user},
         )
@@ -83,8 +84,10 @@ def test_rls_blocks_cross_workspace_as_decyra_app(db: Connection) -> None:
         with db.begin_nested():
             db.execute(
                 text(
-                    "INSERT INTO documents (workspace_id, filename, "
-                    "uploaded_by) VALUES (:b, 'evil.pdf', :u)"
+                    "INSERT INTO documents (workspace_id, filename, uploaded_by, "
+                    "storage_key, mime_type, size_bytes, extracted_text, "
+                    "extraction_status) VALUES (:b, 'evil.pdf', :u, 'evil', "
+                    "'application/pdf', 0, '', 'ok')"
                 ),
                 {"b": ws_b, "u": user},
             )
