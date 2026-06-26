@@ -245,11 +245,11 @@
 - **PII-GRENZE für 5.2/5.3:** `extracted_text` ist potenzielle PII (RLS, löschbar, wie `messages`). 5.1 speichert nur — kein LLM, kein Routing. **5.2/5.3 MÜSSEN** Dokumenttext durch dieselbe Sovereign/Strict-Logik wie User-Input schicken (siehe 5.3-Punkt „PII-Check auch auf RAG-Kontext" + „bei RAG neu bewerten"). 5.1 öffnet die Tür, 5.2/5.3 schließen sie.
 - *Offen (vor Pilot): Pro-Workspace-Quota (Anzahl/Gesamtgröße) gegen Upload-DoS — bewusst aus 5.1 herausgehalten.*
 
-### Task 5.2 — Chunking & Embeddings
-- [ ] Chunking: ~500 Tokens mit ~50 Token Overlap
-- [ ] mistral-embed aufrufen, 1024-dim Vektor je Chunk
-- [ ] Chunks + Embeddings + workspace_id in document_chunks speichern
-- [ ] Batch-Verarbeitung (mehrere Chunks pro API-Call)
+### Task 5.2 — Chunking & Embeddings ✅
+- [x] Chunking: ~500 Tokens mit ~50 Token Overlap
+- [x] mistral-embed aufrufen, 1024-dim Vektor je Chunk
+- [x] Chunks + Embeddings + workspace_id in document_chunks speichern
+- [x] Batch-Verarbeitung (mehrere Chunks pro API-Call)
 - **DoD:** hochgeladenes Dokument ist vollständig in document_chunks embedded
 
 ### Task 5.3 — Retrieval & Antwort
