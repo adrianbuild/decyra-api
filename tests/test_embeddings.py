@@ -91,3 +91,122 @@ def test_embedding_status_check_constraint(db: Connection):
                 {"w": ws, "u": user},
             )
     assert "embedding_status" in str(exc.value).lower() or "check" in str(exc.value).lower()
+
+
+# --- embed_document (idempotent orchestrator) --------------------------
+
+def _seed_doc(db: Connection, *, status: str = "ok", body: str = "") -> tuple[str, str]:
+    """As postgres: org + workspace + user + one document. Returns (ws, doc_id)."""
+    org = db.execute(
+        text("INSERT INTO organizations (name) VALUES ('O') RETURNING id")
+    ).scalar_one()
+    ws = db.execute(
+        text("INSERT INTO workspaces (organization_id, name) VALUES (:o,'W') "
+             "RETURNING id"), {"o": org},
+    ).scalar_one()
+    user = db.execute(
+        text("INSERT INTO users (email) VALUES ('e@x.de') RETURNING id")
+    ).scalar_one()
+    doc = db.execute(
+        text(
+            "INSERT INTO documents (workspace_id, filename, uploaded_by, "
+            "storage_key, mime_type, size_bytes, extracted_text, "
+            "extraction_status) VALUES (:w,'f.txt',:u,'k','text/plain',:n,:t,:s) "
+            "RETURNING id"
+        ),
+        {"w": ws, "u": user, "n": len(body), "t": body, "s": status},
+    ).scalar_one()
+    return str(ws), str(doc)
+
+
+def _txn_factory(db: Connection):
+    @contextmanager
+    def _open():
+        yield db
+    return _open
+
+
+def test_embed_document_persists_chunks_and_marks_done(db, stub_embed):
+    body = " ".join(f"w{i}" for i in range(1500))  # multiple chunks
+    ws, doc = _seed_doc(db, status="ok", body=body)
+
+    result = embeddings.embed_document(
+        _txn_factory(db), workspace_id=ws, document_id=doc,
+        extracted_text=body, extraction_status="ok",
+        settings=_settings(), log_ctx=_LOG_CTX,
+    )
+    assert result == "done"
+
+    rows = db.execute(
+        text("SELECT workspace_id, chunk_index, embedding IS NOT NULL AS has_vec "
+             "FROM document_chunks WHERE document_id = :d ORDER BY chunk_index"),
+        {"d": doc},
+    ).all()
+    from app.chunking import chunk_text
+    assert len(rows) == len(chunk_text(body))
+    assert all(str(r.workspace_id) == ws and r.has_vec for r in rows)
+    assert [r.chunk_index for r in rows] == list(range(len(rows)))
+
+    status = db.execute(
+        text("SELECT embedding_status FROM documents WHERE id = :d"), {"d": doc}
+    ).scalar_one()
+    assert status == "done"
+
+
+def test_embed_document_idempotent_no_duplicate_chunks(db, stub_embed):
+    body = " ".join(f"w{i}" for i in range(1500))
+    ws, doc = _seed_doc(db, status="ok", body=body)
+    kw = dict(workspace_id=ws, document_id=doc, extracted_text=body,
+              extraction_status="ok", settings=_settings(), log_ctx=_LOG_CTX)
+
+    embeddings.embed_document(_txn_factory(db), **kw)
+    first = db.execute(
+        text("SELECT count(*) FROM document_chunks WHERE document_id=:d"), {"d": doc}
+    ).scalar_one()
+    embeddings.embed_document(_txn_factory(db), **kw)  # re-trigger / retry
+    second = db.execute(
+        text("SELECT count(*) FROM document_chunks WHERE document_id=:d"), {"d": doc}
+    ).scalar_one()
+    assert first == second and first > 0
+
+
+def test_embed_document_no_text_skipped(db, stub_embed):
+    ws, doc = _seed_doc(db, status="no_text", body="")
+    result = embeddings.embed_document(
+        _txn_factory(db), workspace_id=ws, document_id=doc,
+        extracted_text="", extraction_status="no_text",
+        settings=_settings(), log_ctx=_LOG_CTX,
+    )
+    assert result == "skipped"
+    assert stub_embed.calls == []  # no_text → nothing sent to Mistral
+    n = db.execute(
+        text("SELECT count(*) FROM document_chunks WHERE document_id=:d"), {"d": doc}
+    ).scalar_one()
+    assert n == 0
+    status = db.execute(
+        text("SELECT embedding_status FROM documents WHERE id=:d"), {"d": doc}
+    ).scalar_one()
+    assert status == "skipped"
+
+
+def test_embed_document_provider_failure_marks_failed_no_crash(db, stub_embed, caplog):
+    body = "Hallo Decyra Welt"
+    ws, doc = _seed_doc(db, status="ok", body=body)
+    stub_embed.state["fail"] = RuntimeError("mistral down")
+
+    with _decyra_errors_visible(), caplog.at_level(logging.ERROR, logger="decyra.errors"):
+        result = embeddings.embed_document(  # must NOT raise
+            _txn_factory(db), workspace_id=ws, document_id=doc,
+            extracted_text=body, extraction_status="ok",
+            settings=_settings(), log_ctx=_LOG_CTX,
+        )
+    assert result == "failed"
+    n = db.execute(
+        text("SELECT count(*) FROM document_chunks WHERE document_id=:d"), {"d": doc}
+    ).scalar_one()
+    assert n == 0
+    status = db.execute(
+        text("SELECT embedding_status FROM documents WHERE id=:d"), {"d": doc}
+    ).scalar_one()
+    assert status == "failed"
+    assert any("embedding failed" in r.getMessage() for r in caplog.records)

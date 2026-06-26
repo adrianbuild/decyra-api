@@ -20,6 +20,7 @@ import litellm
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
+from app.chunking import chunk_text
 from app.config import Settings
 from app.llm_call import FALLBACK_ERRORS
 
@@ -94,3 +95,67 @@ def embed_texts(
                 raise EmbeddingError("embedding contained a non-finite component")
             vectors.append(vec)
     return vectors
+
+
+def _set_status(open_txn: OpenTxn, workspace_id, document_id, status: str) -> None:
+    with open_txn() as db:
+        _set_workspace(db, workspace_id)
+        db.execute(
+            text("UPDATE documents SET embedding_status = :s WHERE id = :d"),
+            {"s": status, "d": document_id},
+        )
+
+
+def embed_document(
+    open_txn: OpenTxn,
+    *,
+    workspace_id,
+    document_id,
+    extracted_text: str,
+    extraction_status: str,
+    settings,
+    log_ctx,
+) -> str:
+    """Idempotently embed one document into document_chunks and set its
+    embedding_status. Returns the final status.
+
+    - no_text (or blank text) -> 'skipped' (nothing to embed; Invariant 4).
+    - provider failure -> 'failed' (logged, NOT raised: the upload stands;
+      Invariant 2). The document can be re-embedded later.
+    - success -> 'done'.
+
+    Idempotent: existing chunks for the document are DELETEd before insert, so a
+    re-trigger or retry never duplicates (Invariant 4). Every chunk inherits the
+    document's workspace_id (Invariant 1)."""
+    if extraction_status == "no_text" or not extracted_text.strip():
+        _set_status(open_txn, workspace_id, document_id, "skipped")
+        return "skipped"
+
+    chunks = chunk_text(extracted_text)
+    try:
+        vectors = embed_texts(chunks, settings, log_ctx=log_ctx)
+    except EmbeddingError:
+        _set_status(open_txn, workspace_id, document_id, "failed")
+        return "failed"
+
+    with open_txn() as db:
+        _set_workspace(db, workspace_id)
+        db.execute(
+            text("DELETE FROM document_chunks WHERE document_id = :d"),
+            {"d": document_id},
+        )
+        for idx, (content, vec) in enumerate(zip(chunks, vectors)):
+            db.execute(
+                text(
+                    "INSERT INTO document_chunks "
+                    "(document_id, workspace_id, content, chunk_index, embedding) "
+                    "VALUES (:d, :w, :c, :i, (:e)::vector)"
+                ),
+                {"d": document_id, "w": workspace_id, "c": content,
+                 "i": idx, "e": _vec_literal(vec)},
+            )
+        db.execute(
+            text("UPDATE documents SET embedding_status = 'done' WHERE id = :d"),
+            {"d": document_id},
+        )
+    return "done"
