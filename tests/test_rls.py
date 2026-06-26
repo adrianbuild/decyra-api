@@ -136,3 +136,48 @@ async def test_rls_endpoint_isolation_as_decyra_app(
         f"/workspaces/{foreign}/audit/verify", headers=headers
     )
     assert other.status_code == 403
+
+
+def test_document_chunks_rls_isolation_as_decyra_app(db: Connection) -> None:
+    ws_a, ws_b, _user = _seed_two_workspaces(db)  # one document in each
+    doc_a = db.execute(
+        text("SELECT id FROM documents WHERE workspace_id = :w"), {"w": ws_a}
+    ).scalar_one()
+    doc_b = db.execute(
+        text("SELECT id FROM documents WHERE workspace_id = :w"), {"w": ws_b}
+    ).scalar_one()
+    zero = "[" + ",".join(["0.0"] * 1024) + "]"
+    for ws, doc, tag in ((ws_a, doc_a, "a"), (ws_b, doc_b, "b")):
+        db.execute(
+            text(
+                "INSERT INTO document_chunks (document_id, workspace_id, content, "
+                "chunk_index, embedding) VALUES (:d,:w,:c,0,(:e)::vector)"
+            ),
+            {"d": doc, "w": ws, "c": f"chunk-{tag}", "e": zero},
+        )
+
+    db.execute(text("SET LOCAL ROLE decyra_app"))
+    _assert_unprivileged(db)
+    db.execute(
+        text("SELECT set_config('app.current_workspace_id', :w, true)"), {"w": ws_a}
+    )
+
+    # Only workspace A's chunk is visible — proof RLS fires on document_chunks.
+    visible = (
+        db.execute(text("SELECT content FROM document_chunks ORDER BY content"))
+        .scalars().all()
+    )
+    assert visible == ["chunk-a"]
+
+    # Cross-workspace chunk INSERT rejected by WITH CHECK.
+    with pytest.raises(Exception) as exc:
+        with db.begin_nested():
+            db.execute(
+                text(
+                    "INSERT INTO document_chunks (document_id, workspace_id, "
+                    "content, chunk_index, embedding) "
+                    "VALUES (:d,:w,'evil',0,(:e)::vector)"
+                ),
+                {"d": doc_b, "w": ws_b, "e": zero},
+            )
+    assert "row-level security" in str(exc.value).lower()
