@@ -419,3 +419,62 @@ async def test_delete_removes_file_and_text_keeps_tombstone(
         )
     }
     assert "content" not in cols and "extracted_text" not in cols
+
+
+# --- 5.2: upload triggers chunking + embedding -------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_embeds_document(client, db, make_token, settings_override, stub_embed):
+    settings_override()
+    seed_org_with_owner(db, USER_A, "a@firma.de")
+    token = make_token(sub=USER_A, email="a@firma.de")
+
+    r = await client.post(
+        "/documents", headers=_auth(token),
+        files=_files("notes.txt", b"Hallo Decyra Welt aus dem Dokument", "text/plain"),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["embedding_status"] == "done"
+    assert stub_embed.calls  # text was actually sent to (stubbed) Mistral
+
+    n = db.execute(text("SELECT count(*) FROM document_chunks")).scalar_one()
+    assert n >= 1
+    has_vec = db.execute(
+        text("SELECT bool_and(embedding IS NOT NULL) FROM document_chunks")
+    ).scalar_one()
+    assert has_vec is True
+
+
+@pytest.mark.asyncio
+async def test_upload_no_text_skips_embedding(client, db, make_token, settings_override, stub_embed):
+    settings_override()
+    seed_org_with_owner(db, USER_A, "a@firma.de")
+    token = make_token(sub=USER_A, email="a@firma.de")
+
+    r = await client.post(
+        "/documents", headers=_auth(token),
+        files=_files("scan.pdf", make_pdf(None), "application/pdf"),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["extraction_status"] == "no_text"
+    assert r.json()["embedding_status"] == "skipped"
+    assert stub_embed.calls == []
+    assert db.execute(text("SELECT count(*) FROM document_chunks")).scalar_one() == 0
+
+
+@pytest.mark.asyncio
+async def test_upload_embed_failure_still_succeeds(client, db, make_token, settings_override, stub_embed):
+    settings_override()
+    seed_org_with_owner(db, USER_A, "a@firma.de")
+    token = make_token(sub=USER_A, email="a@firma.de")
+    stub_embed.state["fail"] = RuntimeError("mistral down")
+
+    r = await client.post(
+        "/documents", headers=_auth(token),
+        files=_files("notes.txt", b"Hallo Decyra Welt", "text/plain"),
+    )
+    assert r.status_code == 200, r.text  # upload NOT crashed by provider outage
+    assert r.json()["embedding_status"] == "failed"
+    assert db.execute(text("SELECT count(*) FROM document_chunks")).scalar_one() == 0
+    assert db.execute(text("SELECT count(*) FROM documents")).scalar_one() == 1

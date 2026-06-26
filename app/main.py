@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
-from app import chat, documents, invitations, llm_call, mail, pii, storage
+from app import chat, documents, embeddings, invitations, llm_call, mail, pii, storage
 from app.audit import verify_workspace_chain
 from app.auth import AuthenticatedUser, get_current_user
 from app.config import Settings, get_settings
@@ -224,6 +224,7 @@ class DocumentOut(BaseModel):
     mime_type: str
     size_bytes: int
     extraction_status: str
+    embedding_status: str
     created_at: str
 
 
@@ -310,9 +311,24 @@ async def upload_document(
         storage.delete_document(settings.document_storage_dir, key)
         raise
 
+    # 5.2: synchronously chunk + embed into document_chunks. Provider failures
+    # are handled inside (status 'failed', logged) and never crash the upload;
+    # the document row above already committed. embedding_status is also the
+    # seam for a later async move (no schema change needed then).
+    embedding_status = embeddings.embed_document(
+        open_txn,
+        workspace_id=ws,
+        document_id=doc_id,
+        extracted_text=extracted_text,
+        extraction_status=extraction_status,
+        settings=settings,
+        log_ctx={"workspace_id": ws, "user_id": user.user_id},
+    )
+
     return DocumentOut(
         id=doc_id, filename=display_name, mime_type=mime,
         size_bytes=len(data), extraction_status=extraction_status,
+        embedding_status=embedding_status,
         created_at=row.created_at.isoformat(),
     )
 
@@ -328,13 +344,14 @@ def list_documents(
     rows = db.execute(
         text(
             "SELECT id, filename, mime_type, size_bytes, extraction_status, "
-            "created_at FROM documents ORDER BY created_at DESC"
+            "embedding_status, created_at FROM documents ORDER BY created_at DESC"
         )
     ).all()
     return [
         DocumentOut(
             id=str(r.id), filename=r.filename, mime_type=r.mime_type,
             size_bytes=r.size_bytes, extraction_status=r.extraction_status,
+            embedding_status=r.embedding_status,
             created_at=r.created_at.isoformat(),
         )
         for r in rows
