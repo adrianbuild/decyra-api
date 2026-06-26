@@ -440,10 +440,10 @@ async def test_upload_embeds_document(client, db, make_token, settings_override,
 
     n = db.execute(text("SELECT count(*) FROM document_chunks")).scalar_one()
     assert n >= 1
-    has_vec = db.execute(
-        text("SELECT bool_and(embedding IS NOT NULL) FROM document_chunks")
+    dims_ok = db.execute(
+        text("SELECT bool_and(vector_dims(embedding) = 1024) FROM document_chunks")
     ).scalar_one()
-    assert has_vec is True
+    assert dims_ok is True
 
 
 @pytest.mark.asyncio
@@ -478,3 +478,17 @@ async def test_upload_embed_failure_still_succeeds(client, db, make_token, setti
     assert r.json()["embedding_status"] == "failed"
     assert db.execute(text("SELECT count(*) FROM document_chunks")).scalar_one() == 0
     assert db.execute(text("SELECT count(*) FROM documents")).scalar_one() == 1
+
+
+@pytest.mark.asyncio
+async def test_list_documents_returns_embedding_status(client, db, make_token, settings_override, stub_embed):
+    settings_override()
+    seed_org_with_owner(db, USER_A, "a@firma.de")
+    token = make_token(sub=USER_A, email="a@firma.de")
+    await client.post(
+        "/documents", headers=_auth(token),
+        files=_files("notes.txt", b"Hallo Decyra Welt", "text/plain"),
+    )
+    lst = await client.get("/documents", headers=_auth(token))
+    assert lst.status_code == 200
+    assert lst.json()[0]["embedding_status"] == "done"

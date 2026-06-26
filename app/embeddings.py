@@ -141,7 +141,14 @@ def embed_document(
       mutates document_chunks. A future re-embed feature that re-runs this on an
       already-'done' document must choose its own delete-on-failure policy; we
       keep it simple here rather than risk nuking good chunks on a transient
-      outage."""
+      outage.
+    - Only EmbeddingError (provider outage) is converted to 'failed'. An
+      UNEXPECTED error in the persist block (e.g. a DB failure during the chunk
+      INSERT) is deliberately NOT swallowed: it propagates (the upload caller
+      500s) and the document stays at 'pending' with no chunks. That state is
+      recoverable — embed_document is idempotent, so re-running it cleanly
+      completes. We surface real infrastructure errors rather than masking them
+      as 'failed' (the 4.6 lesson: provider outage is graceful, real bugs are not)."""
     if extraction_status == "no_text" or not extracted_text.strip():
         _set_status(open_txn, workspace_id, document_id, "skipped")
         return "skipped"
