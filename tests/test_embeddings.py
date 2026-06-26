@@ -19,6 +19,21 @@ def _settings():
     return get_settings()
 
 
+@contextmanager
+def _decyra_errors_visible():
+    """alembic's fileConfig (conftest session setup) disables existing loggers,
+    so decyra.errors drops records and caplog can't see them — a test-only
+    artifact (alembic runs as its own process in prod, so the API's error
+    logger stays live). Re-enable for the duration of the assertion."""
+    lg = logging.getLogger("decyra.errors")
+    prev = lg.disabled
+    lg.disabled = False
+    try:
+        yield
+    finally:
+        lg.disabled = prev
+
+
 # --- embed_texts -------------------------------------------------------
 
 def test_embed_texts_returns_1024_dim(stub_embed):
@@ -35,10 +50,20 @@ def test_embed_texts_batches_over_max_batch(stub_embed):
     assert [len(b) for b in stub_embed.calls] == [embeddings.MAX_BATCH, 5]
 
 
-def test_embed_texts_provider_failure_raises(stub_embed):
+def test_embed_texts_empty_returns_empty(stub_embed):
+    assert embeddings.embed_texts([], _settings(), log_ctx=_LOG_CTX) == []
+    assert stub_embed.calls == []  # no provider call on empty input
+
+
+def test_embed_texts_provider_failure_raises(stub_embed, caplog):
     stub_embed.state["fail"] = RuntimeError("mistral down")
-    with pytest.raises(embeddings.EmbeddingError):
-        embeddings.embed_texts(["a"], _settings(), log_ctx=_LOG_CTX)
+    with _decyra_errors_visible(), caplog.at_level(logging.ERROR, logger="decyra.errors"):
+        with pytest.raises(embeddings.EmbeddingError):
+            embeddings.embed_texts(["a"], _settings(), log_ctx=_LOG_CTX)
+    assert any(
+        "embedding failed" in r.getMessage() and "transient=False" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # --- migration constraint ---------------------------------------------

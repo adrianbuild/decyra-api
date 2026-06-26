@@ -13,13 +13,14 @@ the upload — the document row already committed.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Callable, ContextManager
 
 import litellm
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from app.chunking import chunk_text
+from app.config import Settings
 from app.llm_call import FALLBACK_ERRORS
 
 errors_logger = logging.getLogger("decyra.errors")
@@ -52,10 +53,19 @@ def _set_workspace(db: Connection, workspace_id: object) -> None:
     )
 
 
-def embed_texts(inputs, settings, *, log_ctx) -> list[list[float]]:
+def embed_texts(
+    inputs: list[str], settings: Settings, *, log_ctx: dict
+) -> list[list[float]]:
     """Embed a list of strings → list of 1024-dim vectors, batched over the
-    Mistral `input` array (<= MAX_BATCH per call). Any provider failure is
-    logged to decyra.errors and re-raised as EmbeddingError."""
+    Mistral `input` array (<= MAX_BATCH per call). Empty input → [] with no
+    provider call. Any provider failure (or a non-finite component returned by
+    the provider) is logged to decyra.errors and re-raised as EmbeddingError.
+
+    The non-finite guard lives HERE (not in _vec_literal): the orchestrator's
+    INSERT loop runs outside the EmbeddingError-handled region, so validating
+    at the provider boundary keeps a NaN/Inf quirk attributed to embedding
+    (document marked 'failed') instead of surfacing as an opaque pgvector
+    INSERT error later."""
     vectors: list[list[float]] = []
     for start in range(0, len(inputs), MAX_BATCH):
         batch = inputs[start:start + MAX_BATCH]
@@ -74,5 +84,13 @@ def embed_texts(inputs, settings, *, log_ctx) -> list[list[float]]:
                 log_ctx.get("workspace_id"),
             )
             raise EmbeddingError(str(e)) from e
-        vectors.extend(d["embedding"] for d in resp.data)
+        for d in resp.data:
+            vec = d["embedding"]
+            if not all(math.isfinite(x) for x in vec):
+                errors_logger.error(
+                    "embedding non-finite model=%s workspace_id=%s",
+                    EMBED_MODEL, log_ctx.get("workspace_id"),
+                )
+                raise EmbeddingError("embedding contained a non-finite component")
+            vectors.append(vec)
     return vectors
