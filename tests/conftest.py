@@ -338,6 +338,39 @@ def stub_llm(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def stub_embed(monkeypatch):
+    """Patch litellm.embedding so pytest NEVER calls Mistral (Invariant 2).
+    Controller: `.state['fail']` = an exception instance raised on the next
+    call (provider-outage path); `.state['dim']` = vector length (default
+    1024); `.calls` records each input batch (to assert batching). Vectors are
+    deterministic (value == index-within-batch), shaped like litellm's
+    OpenAI-normalized EmbeddingResponse (`.data[i]['embedding']`)."""
+    import types
+
+    state = {"fail": None, "dim": 1024}
+    calls: list[list[str]] = []
+
+    def _embedding(**kwargs):  # type: ignore[no-untyped-def]
+        inp = kwargs.get("input")
+        batch = list(inp) if isinstance(inp, list) else [inp]
+        calls.append(batch)
+        if state["fail"] is not None:
+            raise state["fail"]
+        data = [
+            {"object": "embedding", "index": i,
+             "embedding": [float(i)] * state["dim"]}
+            for i in range(len(batch))
+        ]
+        return types.SimpleNamespace(
+            data=data,
+            usage=types.SimpleNamespace(prompt_tokens=0, total_tokens=0),
+        )
+
+    monkeypatch.setattr("litellm.embedding", _embedding)
+    return types.SimpleNamespace(state=state, calls=calls)
+
+
+@pytest.fixture(autouse=True)
 def stub_pii(monkeypatch):
     """Patch app.pii.contains_pii so pytest never calls Presidio. Default:
     CLEAN (no reroute) → the 70 pre-4.5a tests are unaffected. Controller
