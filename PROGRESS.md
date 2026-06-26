@@ -99,6 +99,12 @@ Eigenschaften, vor Pilot bewerten):
   `documents.extracted_text` (RLS-geschützt, löschbar) — wie `messages`. In 5.1
   geht er an KEIN LLM. 5.2/5.3 MÜSSEN ihn vor dem Cloud-Versand durch die
   Sovereign/Strict-Logik schicken (siehe Tür/Grenze im 5.1-Session-Eintrag).
+- **PRE-PILOT-Pflicht aus 5.2 (vor erstem echten Kunden, nicht vor Code):**
+  Mistral Subprocessor-Tab (Trust Center) + DPA gegenprüfen — Beleg, dass auch
+  keine *transiente* Verarbeitung außerhalb der EU stattfindet ("Depending on
+  the feature you use, your data can be temporarily transferred outside the
+  EU"). EU-Residenz von mistral-embed ist verifiziert (siehe 5.2-Session-
+  Eintrag), die transiente Verarbeitung ist der offene Pre-Pilot-Beleg.
 
 NEU offen aus 2.3:
 
@@ -144,6 +150,31 @@ Die drei ursprünglichen Punkte:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-26: **Task 5.2 — Chunking & Embeddings (Entscheidungen / Grenzen).**
+  - **EU-Residenz (verifiziert):** mistral-embed läuft über `api.mistral.ai`,
+    EU ist Default (US ist expliziter Opt-in). Wir setzen NIE eine US-
+    `MISTRAL_API_BASE`. Quelle: Mistral Help Center „Where do you store my
+    data" + API-Doku (`POST /v1/embeddings`, `mistral-embed`, 1024-dim).
+  - **PRE-PILOT-Pflicht (vor erstem echten Kunden, nicht vor Code):** Mistral
+    Subprocessor-Tab (Trust Center) + DPA gegenprüfen — Beleg, dass auch keine
+    *transiente* Verarbeitung außerhalb der EU stattfindet ("Depending on the
+    feature you use, your data can be temporarily transferred outside the EU").
+    Auch oben in der Pre-Pilot-Härtungsliste vermerkt.
+  - **OFFENE ARCHITEKTUR-ENTSCHEIDUNG (5.3): PII vor dem Embedden im Strict-
+    Modus.** Sovereign-Modus: rohes Embedden an Mistral-EU ist ok (EU-Residenz).
+    Strict-Modus anonymisiert PII vor Cloud-Versand — gilt das auch fürs
+    Embedden? Konflikt: (a) rohes Embedden verletzt Strict; (b) anonymisiertes
+    Embedden macht die PII-Suche unbrauchbar (anonymisierte Vektoren matchen
+    PII-Queries nicht); (c) lokales Embedding-Modell wäre die saubere Strict-
+    Lösung. NICHT in 5.2 gebaut — Entscheidung gehört zu 5.3.
+  - **Sync → async Skalierungs-Kandidat:** 5.2 embeddet synchron im Upload-
+    Request. Große PDFs blockieren den Request. `documents.embedding_status`
+    (pending/done/failed/skipped) ist als Vorbau da, damit ein Umzug auf einen
+    Background-Task (FastAPI BackgroundTasks) keine Schema-Änderung braucht.
+  - **Idempotenz:** Re-Embedding löscht zuerst die alten Chunks des Dokuments
+    (delete-before-insert), keine Doppel-Chunks. `no_text` → `skipped`. Ein
+    unerwarteter DB-Fehler im Persist-Block wird NICHT als `failed` maskiert
+    (er propagiert → 500, Dokument bleibt recoverable auf `pending`).
 - 2026-06-25: **Task 5.1 abgeschlossen — Dokument-Upload & Text-Extraktion**
   (decyra-api). PDF/DOCX/TXT hochladen → Text extrahiert → Rohdatei lokal +
   Metadaten/Text in der (RLS'd) `documents`-Tabelle → listen → löschen.
