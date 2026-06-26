@@ -97,7 +97,9 @@ def embed_texts(
     return vectors
 
 
-def _set_status(open_txn: OpenTxn, workspace_id, document_id, status: str) -> None:
+def _set_status(
+    open_txn: OpenTxn, workspace_id: object, document_id: object, status: str
+) -> None:
     with open_txn() as db:
         _set_workspace(db, workspace_id)
         db.execute(
@@ -109,12 +111,12 @@ def _set_status(open_txn: OpenTxn, workspace_id, document_id, status: str) -> No
 def embed_document(
     open_txn: OpenTxn,
     *,
-    workspace_id,
-    document_id,
+    workspace_id: object,
+    document_id: object,
     extracted_text: str,
     extraction_status: str,
-    settings,
-    log_ctx,
+    settings: Settings,
+    log_ctx: dict,
 ) -> str:
     """Idempotently embed one document into document_chunks and set its
     embedding_status. Returns the final status.
@@ -124,9 +126,22 @@ def embed_document(
       Invariant 2). The document can be re-embedded later.
     - success -> 'done'.
 
-    Idempotent: existing chunks for the document are DELETEd before insert, so a
-    re-trigger or retry never duplicates (Invariant 4). Every chunk inherits the
-    document's workspace_id (Invariant 1)."""
+    Idempotent: on the SUCCESS path, existing chunks for the document are
+    DELETEd before insert (one txn), so a re-trigger or retry never duplicates
+    (Invariant 4). Every chunk inherits the document's workspace_id explicitly
+    (Invariant 1 — holds by column, not only by RLS).
+
+    Contract / boundaries (deliberate for 5.2):
+    - The caller MUST have committed the document row before invoking (the
+      upload path commits it first), so the status UPDATE always hits an
+      existing row.
+    - The 'failed' and 'skipped' paths do NOT touch existing chunks. In 5.2
+      embed_document only ever runs on a freshly-uploaded document (zero prior
+      chunks), so 'failed' implies no chunks in practice. Only the success path
+      mutates document_chunks. A future re-embed feature that re-runs this on an
+      already-'done' document must choose its own delete-on-failure policy; we
+      keep it simple here rather than risk nuking good chunks on a transient
+      outage."""
     if extraction_status == "no_text" or not extracted_text.strip():
         _set_status(open_txn, workspace_id, document_id, "skipped")
         return "skipped"

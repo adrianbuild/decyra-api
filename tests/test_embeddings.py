@@ -210,3 +210,27 @@ def test_embed_document_provider_failure_marks_failed_no_crash(db, stub_embed, c
     ).scalar_one()
     assert status == "failed"
     assert any("embedding failed" in r.getMessage() for r in caplog.records)
+
+
+def test_embed_document_recovers_after_failed_attempt(db, stub_embed):
+    body = " ".join(f"w{i}" for i in range(800))
+    ws, doc = _seed_doc(db, status="ok", body=body)
+    kw = dict(workspace_id=ws, document_id=doc, extracted_text=body,
+              extraction_status="ok", settings=_settings(), log_ctx=_LOG_CTX)
+
+    stub_embed.state["fail"] = RuntimeError("mistral down")
+    assert embeddings.embed_document(_txn_factory(db), **kw) == "failed"
+    assert db.execute(
+        text("SELECT count(*) FROM document_chunks WHERE document_id=:d"), {"d": doc}
+    ).scalar_one() == 0
+
+    stub_embed.state["fail"] = None  # provider recovers
+    assert embeddings.embed_document(_txn_factory(db), **kw) == "done"
+    from app.chunking import chunk_text
+    n = db.execute(
+        text("SELECT count(*) FROM document_chunks WHERE document_id=:d"), {"d": doc}
+    ).scalar_one()
+    assert n == len(chunk_text(body)) and n > 0
+    assert db.execute(
+        text("SELECT embedding_status FROM documents WHERE id=:d"), {"d": doc}
+    ).scalar_one() == "done"
