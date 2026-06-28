@@ -344,10 +344,12 @@ def stub_embed(monkeypatch):
     call (provider-outage path); `.state['dim']` = vector length (default
     1024); `.calls` records each input batch (to assert batching). Vectors are
     deterministic (value == index-within-batch), shaped like litellm's
-    OpenAI-normalized EmbeddingResponse (`.data[i]['embedding']`)."""
+    OpenAI-normalized EmbeddingResponse (`.data[i]['embedding']`).
+    `.state['vectors']` = explicit per-input vectors to return (overrides the
+    index-based default)."""
     import types
 
-    state = {"fail": None, "dim": 1024}
+    state = {"fail": None, "dim": 1024, "vectors": None}
     calls: list[list[str]] = []
 
     def _embedding(**kwargs):  # type: ignore[no-untyped-def]
@@ -356,11 +358,17 @@ def stub_embed(monkeypatch):
         calls.append(batch)
         if state["fail"] is not None:
             raise state["fail"]
-        data = [
-            {"object": "embedding", "index": i,
-             "embedding": [float(i)] * state["dim"]}
-            for i in range(len(batch))
-        ]
+        if state["vectors"] is not None:
+            data = [
+                {"object": "embedding", "index": i, "embedding": list(state["vectors"][i])}
+                for i in range(len(batch))
+            ]
+        else:
+            data = [
+                {"object": "embedding", "index": i,
+                 "embedding": [float(i)] * state["dim"]}
+                for i in range(len(batch))
+            ]
         return types.SimpleNamespace(
             data=data,
             usage=types.SimpleNamespace(prompt_tokens=0, total_tokens=0),
