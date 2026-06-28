@@ -21,6 +21,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
 from app import chat, documents, embeddings, invitations, llm_call, mail, pii, storage
+from app import retrieval
 from app.audit import verify_workspace_chain
 from app.auth import AuthenticatedUser, get_current_user
 from app.config import Settings, get_settings
@@ -731,6 +732,7 @@ def chat_completions(
     # messages array: stored history is always prepended.
     set_workspace_context(db_read, ws)
     existing_cid: str | None = None
+    history: list[dict] = []
     if payload.conversation_id:
         try:
             UUID(payload.conversation_id)
@@ -745,9 +747,31 @@ def chat_completions(
                 status.HTTP_404_NOT_FOUND, detail="conversation not found"
             )
         existing_cid = payload.conversation_id
-        llm_input = chat.load_history(db_read, payload.conversation_id) + new_messages
-    else:
-        llm_input = new_messages
+        history = chat.load_history(db_read, payload.conversation_id)
+
+    # --- RAG retrieval (Task 5.3): opt-in, RLS-scoped, PROVIDER-ONLY context ---
+    # The retrieved chunks are sent to the model + audited (they transit), but
+    # NEVER persisted as a message and NEVER reloaded as history. Search is local
+    # on raw chunks (RLS'd); strict anonymisation happens downstream over the SAME
+    # mapping as user+history. A query-embed outage degrades gracefully (no
+    # context) rather than failing the chat.
+    rag_context_msgs: list[dict] = []
+    rag_chunk_text = ""
+    if payload.use_company_knowledge:
+        query = retrieval.latest_user_query(new_messages)
+        if query:
+            try:
+                chunks = retrieval.retrieve_chunks(
+                    db_read, ws, query, settings,
+                    log_ctx={"workspace_id": ws, "user_id": user.user_id},
+                )
+            except embeddings.EmbeddingError:
+                chunks = []  # query-embed outage: degrade gracefully (already logged)
+            if chunks:
+                rag_context_msgs = [retrieval.build_context_message(chunks)]
+                rag_chunk_text = retrieval.chunk_join(chunks)
+
+    llm_input = history + rag_context_msgs + new_messages
 
     # --- PII check on the FULL llm_input (history + new) — Invariant 1 ---
     # The whole input is scanned in BOTH modes: history is re-sent, so a later
@@ -830,7 +854,11 @@ def chat_completions(
         # pii_detected/pii_check and the 4.5a reroute (only when protection is
         # needed). User PII in stored history is still in user_text -> the
         # one-way ratchet is preserved.
-        outcome = pii.contains_pii(user_text, settings)
+        # Invariant 3 ("bei RAG neu bewerten"): retrieved chunk text is REAL
+        # stored data (not model output), so chunk PII counts toward the reroute
+        # decision. Model output still does not (the user_text-only ratchet holds).
+        routing_text = user_text + ("\n" + rag_chunk_text if rag_chunk_text else "")
+        outcome = pii.contains_pii(routing_text, settings)
         effective_model, eff_row = _resolve_effective_model(
             db_read,
             chosen_model=payload.model,
@@ -838,6 +866,20 @@ def chat_completions(
             outcome=outcome,
             settings=settings,
         )
+
+    # Invariant 5: the retrieved context transited this turn → include it in the
+    # audit request_text. llm_input_for_provider is anonymised in strict, raw in
+    # sovereign, so this captures exactly what left the house. The context is
+    # provider-only — it is NOT persisted as a message.
+    if rag_context_msgs:
+        transited_context = llm_input_for_provider[
+            len(history) : len(history) + len(rag_context_msgs)
+        ]
+        context_audit = "\n\n".join(
+            m["content"] for m in transited_context if m.get("content")
+        )
+        if context_audit:
+            audit_request = context_audit + "\n\n" + audit_request
 
     if effective_model != payload.model:
         if outcome.status == "unavailable" or (mode == "strict" and not anonymized):
