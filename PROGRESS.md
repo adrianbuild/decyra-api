@@ -150,6 +150,35 @@ Die drei ursprünglichen Punkte:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-28: **Task 5.3 — Retrieval & Antwort (RAG, Entscheidungen / Grenzen).**
+  - **Vektor-Suche:** RLS-scoped `<=>`-Cosine über document_chunks, top_k=5,
+    Schwelle 0.5 (konservativ — lieber kein als schlechter Kontext). **Kein
+    Vektor-Index** (exakte Suche, kein Recall-Verlust; ivfflat/hnsw später als
+    reine Migration ab ~>10k Chunks/Workspace).
+  - **Provider-only-Kontext:** gefundene Chunks gehen als System-Message an das
+    Modell + ins Audit, werden ABER nie als Message persistiert und nie als
+    Historie zurückgeladen. Trennung „provider-Messages vs. persistable
+    Messages" (persist nutzt nur new_messages).
+  - **Strict-Koreferenz:** Chunks landen in DERSELBEN `anonymize_messages`-Liste
+    wie User+Historie → gleiche PII (z.B. IBAN in Frage UND Chunk) → EIN
+    Platzhalter an die Cloud, eine De-Anon-Map. Suche roh+lokal, Versand
+    anonymisiert. Das Audit (I5) erfasst den ANONYMISIERTEN Kontext (gelesen aus
+    llm_input_for_provider NACH der Anonymisierung) — nie rohe Chunk-PII in der
+    unveränderlichen Kette.
+  - **Sovereign-Routing (Auflösung „bei RAG neu bewerten"):**
+    `routing_text = user_text + chunk_text`. Chunk-PII = reale gespeicherte
+    Daten → erzwingt EU-Reroute bei US-Modellwahl. Modell-Output zählt weiterhin
+    NICHT (User-Text-Ratchet bleibt).
+  - **OFFENE GRENZE (Strict-Query-Embedding):** Die Such-Query wird im Strict
+    ROH via mistral-embed an Mistral-EU geschickt (EU-resident, aber NICHT
+    "verlässt das System nie"). Anonymisieren bräche die Suche. Gehört zur selben
+    offenen Architektur-Frage wie Chunk-Embedden (5.2): ein lokales Embedding-
+    Modell ist die einzige Voll-Lösung. **Pre-Pilot/5.x-Kandidat.**
+  - **Audit (I5):** der transitierte (im Strict anonymisierte) Kontext steht in
+    `request_text`; keine neue Spalte. Strukturierte Quellen-Metadaten = Block 6.
+  - **Graceful degrade:** Query-Embed-Ausfall (mistral-embed down) → Chat läuft
+    ohne RAG-Kontext weiter (kein Crash), Fehler in decyra.errors + Info-Log im
+    Handler.
 - 2026-06-26: **Task 5.2 — Chunking & Embeddings (Entscheidungen / Grenzen).**
   - **EU-Residenz (verifiziert):** mistral-embed läuft über `api.mistral.ai`,
     EU ist Default (US ist expliziter Opt-in). Wir setzen NIE eine US-
