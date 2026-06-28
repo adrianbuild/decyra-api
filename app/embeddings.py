@@ -39,9 +39,9 @@ class EmbeddingError(Exception):
     crash the request."""
 
 
-def _vec_literal(vec: list[float]) -> str:
+def vec_literal(vec: list[float]) -> str:
     """pgvector text literal '[a,b,...]' for the `::vector` cast (no pgvector
-    Python dependency)."""
+    Python dependency). Shared by embed_document (insert) and retrieval (query)."""
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
 
@@ -62,7 +62,7 @@ def embed_texts(
     provider call. Any provider failure (or a non-finite component returned by
     the provider) is logged to decyra.errors and re-raised as EmbeddingError.
 
-    The non-finite guard lives HERE (not in _vec_literal): the orchestrator's
+    The non-finite guard lives HERE (not in vec_literal): the orchestrator's
     INSERT loop runs outside the EmbeddingError-handled region, so validating
     at the provider boundary keeps a NaN/Inf quirk attributed to embedding
     (document marked 'failed') instead of surfacing as an opaque pgvector
@@ -174,7 +174,7 @@ def embed_document(
                     "VALUES (:d, :w, :c, :i, (:e)::vector)"
                 ),
                 {"d": document_id, "w": workspace_id, "c": content,
-                 "i": idx, "e": _vec_literal(vec)},
+                 "i": idx, "e": vec_literal(vec)},
             )
         db.execute(
             text("UPDATE documents SET embedding_status = 'done' WHERE id = :d"),
