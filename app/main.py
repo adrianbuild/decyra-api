@@ -483,6 +483,10 @@ class ChatCompletionRequest(BaseModel):
     # Task 4.5b: per-chat PII mode override. None -> inherit the conversation's
     # stored mode, else the workspace default. Validated against the allowed set.
     pii_mode: str | None = None
+    # Task 5.3: opt-in RAG ("Company Knowledge" toggle). When true, the latest
+    # user question retrieves workspace document chunks injected as provider-only
+    # context. Default off — not every chat needs RAG.
+    use_company_knowledge: bool = False
 
 
 _VALID_PII_MODES = ("sovereign", "strict")
