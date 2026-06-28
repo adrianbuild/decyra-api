@@ -252,13 +252,13 @@
 - [x] Batch-Verarbeitung (mehrere Chunks pro API-Call)
 - **DoD:** hochgeladenes Dokument ist vollständig in document_chunks embedded
 
-### Task 5.3 — Retrieval & Antwort
-- [ ] Vektor-Suche: Query embedden, Top-k Chunks via Cosine (pgvector)
-- [ ] Nur Chunks aus eigenem Workspace (RLS + WHERE)
-- [ ] Chunks als Kontext in den Prompt einbauen
-- [ ] Quellenangabe (Dokumentname + Chunk) in Antwort
-- [ ] PII-Check auch auf RAG-Kontext → ggf. Sovereign
-- [ ] Test: Frage zu hochgeladenem Dokument wird korrekt + mit Quelle beantwortet
+### Task 5.3 — Retrieval & Antwort ✅
+- [x] Vektor-Suche: Query embedden, Top-k Chunks via Cosine (pgvector)
+- [x] Nur Chunks aus eigenem Workspace (RLS + WHERE)
+- [x] Chunks als Kontext in den Prompt einbauen
+- [x] Quellenangabe (Dokumentname + Chunk) in Antwort
+- [x] PII-Check auch auf RAG-Kontext → ggf. Sovereign
+- [x] Test: Frage zu hochgeladenem Dokument wird korrekt + mit Quelle beantwortet
 - **DoD:** RAG-Antwort korrekt, mit Quelle, PII-sicher
 
 ---
