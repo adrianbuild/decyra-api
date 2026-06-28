@@ -90,6 +90,9 @@ def chunk_join(chunks: list[RetrievedChunk]) -> str:
 
 
 def build_context_message(chunks: list[RetrievedChunk]) -> dict:
-    """A single PROVIDER-ONLY system message: header + source-tagged chunks. Caller must only invoke with a non-empty chunks list (skip the context message when retrieval returns [])."""
+    """A single PROVIDER-ONLY system message: header + source-tagged chunks.
+
+    Caller must only invoke with a non-empty `chunks` list (skip the context
+    message entirely when retrieval returns [])."""
     parts = [f"[Quelle: {c.filename} #{c.chunk_index}]\n{c.content}" for c in chunks]
     return {"role": "system", "content": _CONTEXT_HEADER + "\n\n" + "\n\n".join(parts)}

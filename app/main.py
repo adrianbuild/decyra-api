@@ -766,7 +766,10 @@ def chat_completions(
                     log_ctx={"workspace_id": ws, "user_id": user.user_id},
                 )
             except embeddings.EmbeddingError:
-                chunks = []  # query-embed outage: degrade gracefully (already logged)
+                # query-embed outage: degrade gracefully (no RAG context). The
+                # provider error is logged in embeddings; record the decision here too.
+                chunks = []
+                logger.info("RAG context degraded — query embed unavailable (ws=%s)", ws)
             if chunks:
                 rag_context_msgs = [retrieval.build_context_message(chunks)]
                 rag_chunk_text = retrieval.chunk_join(chunks)
