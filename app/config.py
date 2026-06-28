@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     # by the spoofable Content-Length header).
     max_upload_bytes: int = 25 * 1024 * 1024  # 25 MiB
 
+    # RAG retrieval (Task 5.3). Conservative similarity floor: better no context
+    # than a weak match (compliance trust). Cosine similarity = 1 - (<=> distance).
+    rag_top_k: int = 5
+    rag_similarity_threshold: float = 0.5
+
 
 @lru_cache
 def get_settings() -> Settings:
