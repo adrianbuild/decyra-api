@@ -68,6 +68,10 @@ class Settings(BaseSettings):
     # Hard server-side upload cap (enforced by counting streamed bytes, never
     # by the spoofable Content-Length header).
     max_upload_bytes: int = 25 * 1024 * 1024  # 25 MiB
+    # Separate cap on the EXTRACTED text length (chars), independent of the byte
+    # limit above: a small xlsx/csv can expand into a huge text blob. Too long
+    # is REJECTED (HTTP 413 at the call site), never truncated.
+    max_extracted_chars: int = 200_000
 
     # RAG retrieval (Task 5.3). Conservative similarity floor: better no context
     # than a weak match (compliance trust). Cosine similarity = 1 - (<=> distance).

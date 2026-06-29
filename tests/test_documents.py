@@ -16,10 +16,12 @@ from __future__ import annotations
 import io
 import zipfile
 
+import openpyxl
 import pytest
 from docx import Document as DocxDocument
 from sqlalchemy import text
 
+from app import documents as docs
 from app.config import get_settings
 from app.main import app
 from tests._helpers import seed_org_with_owner
@@ -83,6 +85,27 @@ def make_bare_zip() -> bytes:
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64  # valid PNG signature + junk
+
+
+def make_xlsx(rows: list[list]) -> bytes:
+    """Minimal real .xlsx workbook (single sheet) built with openpyxl."""
+    buf = io.BytesIO()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for row in rows:
+        ws.append(row)
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def make_csv(text_content: str, encoding: str = "utf-8") -> bytes:
+    """CSV bytes in the requested encoding (cp1252 to test the fallback)."""
+    return text_content.encode(encoding)
+
+
+def make_disguised_zip() -> bytes:
+    """A plain ZIP (not xlsx/docx structure) — renamed .xlsx must be rejected."""
+    return make_bare_zip()
 
 
 # --- fixtures ----------------------------------------------------------
@@ -492,3 +515,107 @@ async def test_list_documents_returns_embedding_status(client, db, make_token, s
     lst = await client.get("/documents", headers=_auth(token))
     assert lst.status_code == 200
     assert lst.json()[0]["embedding_status"] == "done"
+
+
+# --- 5B.1: xlsx support (openpyxl) -------------------------------------
+
+
+def test_xlsx_sniff_and_extract_ok():
+    """A real workbook sniffs as XLSX and its cell text is extracted (status ok)."""
+    data = make_xlsx([["Name", "Umsatz"], ["Müller GmbH", 1200], ["", "Q3"]])
+    assert docs.sniff_mime(data) == docs.XLSX_MIME
+
+    text_out, status = docs.extract_text(docs.XLSX_MIME, data)
+    assert status == "ok"
+    assert "Name" in text_out and "Umsatz" in text_out
+    assert "Müller GmbH" in text_out and "1200" in text_out
+
+
+def test_xlsx_not_misclassified_as_docx():
+    """A real xlsx is a ZIP like docx — it must sniff as XLSX, not DOCX."""
+    data = make_xlsx([["a", "b"]])
+    assert docs._is_real_xlsx(data) is True
+    assert docs._is_real_docx(data) is False
+
+
+def test_plain_zip_renamed_xlsx_rejected():
+    """A bare ZIP (no xl/workbook.xml + spreadsheetml content type) is rejected."""
+    with pytest.raises(docs.UnsupportedType):
+        docs.sniff_mime(make_disguised_zip())
+    assert docs._is_real_xlsx(make_disguised_zip()) is False
+
+
+def test_nonzip_binary_renamed_xlsx_rejected():
+    """A non-ZIP binary (PNG) named .xlsx is rejected (recognised binary)."""
+    with pytest.raises(docs.UnsupportedType):
+        docs.sniff_mime(PNG_BYTES)
+    assert docs._is_real_xlsx(PNG_BYTES) is False
+
+
+# --- 5B.1: csv as text, cp1252 fallback + hard binary guard ------------
+
+
+def test_csv_utf8_sniffs_and_extracts_as_text():
+    data = make_csv("name,umsatz\nMueller,1200\n")
+    assert docs.sniff_mime(data) == docs.TXT_MIME
+    text_out, status = docs.extract_text(docs.TXT_MIME, data)
+    assert status == "ok"
+    assert "Mueller" in text_out
+
+
+def test_csv_cp1252_german_accepted_and_decoded():
+    """German umlauts encoded cp1252 are INVALID utf-8 but must be ACCEPTED and
+    correctly decoded via the cp1252/latin-1 fallback."""
+    raw = make_csv("name,stadt\nMüller,Köln\nWeiß,Zürich\n", encoding="cp1252")
+    with pytest.raises(UnicodeDecodeError):  # confirm the bytes are NOT valid utf-8
+        raw.decode("utf-8")
+
+    assert docs.sniff_mime(raw) == docs.TXT_MIME
+    text_out, status = docs.extract_text(docs.TXT_MIME, raw)
+    assert status == "ok"
+    assert "Müller" in text_out and "Köln" in text_out and "Zürich" in text_out
+
+
+def test_csv_binary_guard_rejects_nul_bytes():
+    """SECURITY: bytes with a NUL byte (but no binary magic) are rejected by the
+    binary guard — the cp1252 fallback must NOT swallow them."""
+    raw = b"name,val\nok," + b"\x00\x00\x00\x01\x02\x03" + b"\nmore"
+    with pytest.raises(docs.UnsupportedType):
+        docs._decode_text(raw)
+    with pytest.raises(docs.UnsupportedType):
+        docs.sniff_mime(raw)
+
+
+def test_csv_binary_guard_rejects_disguised_png():
+    """SECURITY: PNG bytes named .csv are rejected even though cp1252 exists.
+    (PNG is caught by filetype.guess as a recognised binary.)"""
+    with pytest.raises(docs.UnsupportedType):
+        docs.sniff_mime(PNG_BYTES)
+
+
+def test_decode_text_high_control_ratio_rejected():
+    """SECURITY: no binary magic, no NUL, but a high ratio of control chars ->
+    rejected (binary garbage that cp1252 would otherwise silently decode)."""
+    raw = bytes(range(1, 9)) * 8  # \x01..\x08 control chars, no NUL, no magic
+    with pytest.raises(docs.UnsupportedType):
+        docs._decode_text(raw)
+
+
+def test_decode_text_allows_tabs_and_newlines():
+    """Tab/newline/CR are legitimate text whitespace, not 'control garbage'."""
+    raw = b"a,b,c\tx\r\n1,2,3\n"
+    assert docs._decode_text(raw) == raw.decode("utf-8")
+
+
+# --- 5B.1 / Part C: extracted-text size cap ----------------------------
+
+
+def test_enforce_extract_cap_over_limit_raises():
+    with pytest.raises(docs.TooLargeExtract):
+        docs.enforce_extract_cap("x" * 11, 10)
+
+
+def test_enforce_extract_cap_at_and_under_limit_ok():
+    docs.enforce_extract_cap("x" * 10, 10)  # at the limit: allowed
+    docs.enforce_extract_cap("x" * 3, 10)   # under: allowed
+    # no exception == pass
