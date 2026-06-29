@@ -3,10 +3,13 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 5 — RAG**: 5.1 (Dokument-Upload & Text-Extraktion) abgeschlossen.
-**143 Tests grün** (+14 in test_documents.py). Nächster Task: 5.2 (Chunking &
-Embeddings). Live-Smoke (echtes PDF/DOCX/TXT-Upload durch User) ausstehend.
-**Block 4 davor KOMPLETT** (4.1–4.6 inkl. 4.5a+4.5b).
+**Block 5B — Chat-Features**: 5B.1 (Datei-Upload in Chat, Einzelanalyse)
+abgeschlossen. **206 Tests grün** + Live-Smoke (beide PII-Modi, Re-Injektion
+Turn 2, „dauerhaft speichern"→RAG) gegen echtes Postgres/Presidio/Mistral.
+Auf `main` gemergt (api + web). Nächste offene Tasks: die übrigen 5B-Punkte
+(5B.2 Datenanalyse/Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library,
+5B.6 Projects) + der Company-Knowledge-Toggle (WORKPLAN Z. 326).
+**Block 5 (RAG) davor KOMPLETT** (5.1+5.2+5.3); **Block 4 KOMPLETT** (4.1–4.6).
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
@@ -14,8 +17,8 @@ Embeddings). Live-Smoke (echtes PDF/DOCX/TXT-Upload durch User) ausstehend.
 - [~] Block 2 — Auth & Multi-Tenant ([x] 2.1 Auth-Code + JWKS; [x] 2.2a Login-UI + Email/Passwort; [x] 2.2b Workspace/Org-Onboarding + Membership-Check; [x] 2.2c decyra_app-Switch + RLS scharf; [x] 2.3 Einladungen & Rollen; [ ] 2.4)
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
 - [x] Block 4 — Routing/Chat/PII ([x] 4.1 Phase A; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [x] 4.4 Streaming; [x] 4.5a PII-Erkennung + Sovereign-Routing; [x] 4.5b Strict-Modus; [x] 4.6 Fehler/Fallback)
-- [~] Block 5 — RAG ([x] 5.1 Upload & Text-Extraktion; [ ] 5.2 Embeddings; [ ] 5.3 Retrieval)
-- [ ] Block 5B — Chat-Features (5B.1 Datei-Upload, 5B.2 Datenanalyse+Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects)
+- [x] Block 5 — RAG ([x] 5.1 Upload & Text-Extraktion; [x] 5.2 Embeddings; [x] 5.3 Retrieval)
+- [~] Block 5B — Chat-Features ([x] 5B.1 Datei-Upload; [ ] 5B.2 Datenanalyse+Charts, [ ] 5B.3 Vision, [ ] 5B.4 Bildgen, [ ] 5B.5 Prompt Library, [ ] 5B.6 Projects)
 - [ ] Block 6 — Frontend (6.1 Chat, 6.2 Dashboard Logs, 6.3 Dashboard Verwaltung)
 - [ ] Block 7 — Extension (7.1 Grundgerüst, 7.2 ChatGPT-Integration)
 - [ ] Block 8 — Deployment & Pilot (8.1 Deploy, 8.2 Doku, 8.3 Go-Live)
@@ -105,6 +108,17 @@ Eigenschaften, vor Pilot bewerten):
   the feature you use, your data can be temporarily transferred outside the
   EU"). EU-Residenz von mistral-embed ist verifiziert (siehe 5.2-Session-
   Eintrag), die transiente Verarbeitung ist der offene Pre-Pilot-Beleg.
+- **Datei-Anhang im Chat (5B.1, vor Pilot bewerten):**
+  - **Company-Knowledge-Toggle (WORKPLAN Z. 326) noch offen** — der RAG-
+    Wissensdatenbank-Schalter im Chat-Frontend ist nicht Teil von 5B.1 und
+    unverifiziert; vor Pilot bauen/prüfen.
+  - **csv-Encoding-Abdeckung:** aktuell nur UTF-8 + cp1252-Fallback. Nutzen
+    Kunden exotischere Encodings (z.B. ISO-8859-15, UTF-16), werden diese
+    abgelehnt — vor Pilot an echten Kundendateien bewerten, ggf. erweitern.
+  - **Anhang-Lösch-UX + Quotas (DoS-Härtung):** kein UI/Endpoint zum Entfernen
+    eines Anhangs (nur Cascade bei Chat-Löschung); keine Pro-Workspace-Quota auf
+    Anzahl/Gesamtgröße von `chat_attachments`. Wie bei den Dokument-Quotas (5.1)
+    bewusst vertagt — vor Pilot ergänzen.
 
 NEU offen aus 2.3:
 
@@ -150,6 +164,38 @@ Die drei ursprünglichen Punkte:
    bewusst verschobene Email-Bestätigungsflow (für Dev aus).
 
 ## Letzte Session
+- 2026-06-29: **Task 5B.1 abgeschlossen — Datei-Upload in Chat (Einzelanalyse).**
+  206 Tests grün (174→206, +32); Live-Smoke beide PII-Modi + Re-Injektion + RAG-
+  Brücke gegen echtes Postgres/Presidio/Mistral. Auf `main` (api + web).
+  - **Speicher-Modell:** neue Tabelle `chat_attachments` (workspace-RLS,
+    `conversation_id ON DELETE CASCADE`). **Konversationsgebunden, voller Text
+    gespeichert** — eigene Logik, NICHT RAG-intern (keine Embeddings, kein
+    document_chunks, keine Vektorsuche). Bei JEDEM Folge-Turn re-injiziert
+    (`load_attachments` läuft, sobald `existing_cid` gesetzt ist).
+  - **Vierte Quelle:** Dateitext geht als provider-only System-Message in
+    `llm_input` VOR `anonymize_messages` (Strict-Koreferenz geschenkt, gleiche
+    Map wie User+Historie+RAG) UND explizit in den Sovereign-`routing_text`
+    (sonst kein EU-Reroute bei Datei-PII!) UND in den Audit-Slice. Volltext nie
+    in `messages` persistiert; History-Marker = `chat_attachments`-Row.
+  - **Geteilte Extraktion mit `documents`:** `sniff_mime`/`extract_text`/
+    `sanitize_filename` wiederverwendet (kein Duplikat) — xlsx/csv dort ergänzt,
+    nutzt also auch der `/documents`-RAG-Pfad. Getrennt nur Tabelle + Lifecycle
+    (kein storage.py/Roh-File, kein Embedding).
+  - **Extraktion neu:** xlsx via openpyxl (Sniffing wie docx: ZIP +
+    `xl/workbook.xml`); **csv nur UTF-8 + cp1252-Fallback** (Latin-1 für deutsche
+    Excel-CSV) HINTER hartem Binär-Guard (NUL/Control-Ratio VOR Decode, damit
+    cp1252 die Binär-Ablehnung nicht aufweicht). Andere Encodings out-of-scope.
+  - **Text-Cap:** `max_extracted_chars` (200k), Prüfung am Einfügepunkt VOR
+    Conversation-Create/INSERT → 413 „zu groß für Chat-Kontext", **kein** stilles
+    Abschneiden, nie ein zu großer Row gespeichert.
+  - **Multipart-Endpoint:** `/v1/chat/completions` nimmt jetzt JSON ODER
+    multipart (Content-Type-Dispatch, `payload`-Feld + `file`). **JSON-Pfad
+    byte-identisch** (sync-Kern via `run_in_threadpool`), **SSE-Streaming
+    erhalten** (multipart = request-seitig, StreamingResponse = response-seitig).
+  - **Bewusst-harmloser Orphan:** scheitert der LLM-Call NACH dem Early-Create,
+    bleibt Conversation+Anhang ohne Assistant-Message — konsistent mit der 5.1-
+    Orphan-Richtung, KEINE Kompensationslogik (User kann im Chat erneut senden).
+  - **Vertagt (kein Anhang-Lösch-UX, keine Quotas):** siehe Pre-Pilot-Liste.
 - 2026-06-28: **Task 5.3 — Retrieval & Antwort (RAG, Entscheidungen / Grenzen).**
   - **Vektor-Suche:** RLS-scoped `<=>`-Cosine über document_chunks, top_k=5,
     Schwelle 0.5 (konservativ — lieber kein als schlechter Kontext). **Kein
