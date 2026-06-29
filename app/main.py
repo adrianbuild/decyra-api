@@ -10,17 +10,29 @@ from fastapi import (
     FastAPI,
     File,
     HTTPException,
+    Request,
     Response,
     UploadFile,
     status,
 )
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
-from app import chat, documents, embeddings, invitations, llm_call, mail, pii, storage
+from app import (
+    attachments,
+    chat,
+    documents,
+    embeddings,
+    invitations,
+    llm_call,
+    mail,
+    pii,
+    storage,
+)
 from app import retrieval
 from app.audit import verify_workspace_chain
 from app.auth import AuthenticatedUser, get_current_user
@@ -40,6 +52,14 @@ _BAD_REQUEST_MSG = (
     "Anfrage konnte nicht verarbeitet werden (z. B. Kontextlänge überschritten)."
 )
 _PROVIDER_ERROR_MSG = "Modell-Provider-Fehler."
+
+# Task 5B.1: header for the PROVIDER-ONLY chat-attachment context message
+# (mirrors retrieval._CONTEXT_HEADER). The file text is sent + audited but
+# never persisted as a message.
+_FILE_CONTEXT_HEADER = (
+    "Kontext aus vom Nutzer in diesem Chat angehängten Dateien. Beziehe dich "
+    "bei der Antwort auf diese Dateien, wenn sie relevant sind."
+)
 
 
 @asynccontextmanager
@@ -687,21 +707,109 @@ def _stream_turn(
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(
-    payload: ChatCompletionRequest,
+async def chat_completions(
+    request: Request,
     user: AuthenticatedUser = Depends(get_current_user),
     db_read: Connection = Depends(get_db),
     open_txn: Callable[[], ContextManager[Connection]] = Depends(get_write_txn),
     settings: Settings = Depends(get_settings),
 ):
-    """OpenAI-compatible chat proxy. EVERY call (streaming or not) persists
-    the turn and writes an audit event — no path chats without auditing.
+    """Dispatch the OpenAI-compatible chat call. Two request encodings, ONE
+    response model:
+
+    * application/json (default): the JSON body is the ChatCompletionRequest;
+      no attachment. Byte-identical to the pre-5B.1 behaviour.
+    * multipart/form-data (Task 5B.1): the JSON body travels as a form field
+      named ``payload``; an optional ``file`` field carries the attachment,
+      size-capped by COUNTING streamed bytes (Content-Length is spoofable).
+
+    The sync core (``_run_chat_turn``) runs in the threadpool — same execution
+    model the previous sync ``def`` endpoint had, so the JSON path (and its
+    StreamingResponse) stays unchanged.
+    """
+    content_type = request.headers.get("content-type", "")
+    attachment_bytes: bytes | None = None
+    attachment_filename: str | None = None
+
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        raw_payload = form.get("payload")
+        if raw_payload is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="missing 'payload' field",
+            )
+        try:
+            payload = ChatCompletionRequest.model_validate_json(raw_payload)
+        except ValidationError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, detail=exc.errors()
+            )
+        upload = form.get("file")
+        if upload is not None and hasattr(upload, "read"):
+            # Size limit by COUNTING streamed bytes — Content-Length is
+            # spoofable and deliberately never consulted (mirrors /documents).
+            buf = bytearray()
+            while True:
+                part = await upload.read(_UPLOAD_CHUNK)
+                if not part:
+                    break
+                buf += part
+                if len(buf) > settings.max_upload_bytes:
+                    raise HTTPException(
+                        status.HTTP_413_CONTENT_TOO_LARGE, detail="file too large"
+                    )
+            attachment_bytes = bytes(buf)
+            attachment_filename = upload.filename
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, detail="invalid JSON body"
+            )
+        try:
+            payload = ChatCompletionRequest.model_validate(body)
+        except ValidationError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, detail=exc.errors()
+            )
+
+    return await run_in_threadpool(
+        _run_chat_turn,
+        payload,
+        attachment_bytes,
+        attachment_filename,
+        user,
+        db_read,
+        open_txn,
+        settings,
+    )
+
+
+def _run_chat_turn(
+    payload: ChatCompletionRequest,
+    attachment_bytes: bytes | None,
+    attachment_filename: str | None,
+    user: AuthenticatedUser,
+    db_read: Connection,
+    open_txn: Callable[[], ContextManager[Connection]],
+    settings: Settings,
+):
+    """OpenAI-compatible chat proxy (sync core). EVERY call (streaming or not)
+    persists the turn and writes an audit event — no path chats without
+    auditing.
 
     Shared validation runs on db_read FIRST, so 403/400/404 are real HTTP
     statuses returned before any stream begins. Then: stream=true -> SSE
     StreamingResponse; otherwise the non-streaming 4.3 path. Both open a
     SHORT write transaction via ``open_txn()`` so the hash-chain advisory
     lock is held only for the persist (never across the stream).
+
+    Task 5B.1: an optional chat attachment is a PROVIDER-ONLY 4th context
+    source (history + RAG + FILE + new). Its extracted text is stored in
+    chat_attachments (bound to the conversation) and re-injected on EVERY
+    turn — never as a ``messages`` row.
     """
     member = invitations.resolve_membership(db_read, user.user_id)
     if member is None:
@@ -774,7 +882,77 @@ def chat_completions(
                 rag_context_msgs = [retrieval.build_context_message(chunks)]
                 rag_chunk_text = retrieval.chunk_join(chunks)
 
-    llm_input = history + rag_context_msgs + new_messages
+    # --- File attachment (Task 5B.1): PROVIDER-ONLY 4th context source -------
+    # Order (user sharpenings): extract + CAP the new upload BEFORE any DB write,
+    # so an oversize file never creates a conversation/attachment row and never
+    # calls the LLM. Then bind it to the conversation (early-create only when an
+    # attachment is present AND there is no conversation yet). Finally re-inject
+    # ALL of the conversation's attachments EVERY turn (so turn 2 with no upload
+    # still sees the stored file). The text flows into llm_input -> full_text ->
+    # strict anonymisation/coreference are automatic, and into routing_text ->
+    # sovereign reroute fires on file-only PII.
+    if attachment_bytes is not None:
+        try:
+            att_mime = documents.sniff_mime(attachment_bytes)
+        except documents.UnsupportedType:
+            raise HTTPException(
+                status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="unsupported file type (allowed: PDF, DOCX, TXT)",
+            )
+        try:
+            att_text, _att_status = documents.extract_text(att_mime, attachment_bytes)
+        except documents.ExtractionError:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="file could not be processed (corrupt or unreadable)",
+            )
+        # CAP before any write/LLM: an oversize extract is rejected here, so no
+        # conversation, no attachment row, and no provider call ever happen.
+        try:
+            documents.enforce_extract_cap(att_text, settings.max_extracted_chars)
+        except documents.TooLargeExtract:
+            raise HTTPException(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                detail="Datei zu groß für den Chat-Kontext",
+            )
+        att_fname = documents.sanitize_filename(attachment_filename)
+        # Early conversation-create (ONLY with an attachment AND no conversation
+        # yet) so the attachment has a parent to bind to. NOTE: a later LLM
+        # failure may leave a conversation + attachment with no assistant message
+        # — intentionally harmless (consistent with 5.1 orphan handling); no
+        # compensation logic.
+        with open_txn() as db_write:
+            set_workspace_context(db_write, ws)
+            if existing_cid is None:
+                existing_cid = chat.create_conversation(
+                    db_write, ws, user.user_id, chat.derive_title(new_messages),
+                    payload.pii_mode,
+                )
+            attachments.insert_attachment(
+                db_write, existing_cid, ws, att_fname, att_mime,
+                len(attachment_bytes), att_text,
+            )
+
+    # Re-injection: load ALL conversation attachments EVERY turn (conversation-
+    # bound requirement). A turn with no new upload still re-injects stored files.
+    file_context_msgs: list[dict] = []
+    file_text = ""
+    if existing_cid:
+        set_workspace_context(db_read, ws)
+        atts = attachments.load_attachments(db_read, existing_cid)
+        if atts:
+            parts = [
+                f"[Datei: {a.filename}]\n{a.extracted_text}" for a in atts
+            ]
+            file_context_msgs = [
+                {
+                    "role": "system",
+                    "content": _FILE_CONTEXT_HEADER + "\n\n" + "\n\n".join(parts),
+                }
+            ]
+            file_text = "\n".join(a.extracted_text for a in atts)
+
+    llm_input = history + rag_context_msgs + file_context_msgs + new_messages
 
     # --- PII check on the FULL llm_input (history + new) — Invariant 1 ---
     # The whole input is scanned in BOTH modes: history is re-sent, so a later
@@ -860,7 +1038,14 @@ def chat_completions(
         # Invariant 3 ("bei RAG neu bewerten"): retrieved chunk text is REAL
         # stored data (not model output), so chunk PII counts toward the reroute
         # decision. Model output still does not (the user_text-only ratchet holds).
-        routing_text = user_text + ("\n" + rag_chunk_text if rag_chunk_text else "")
+        # Task 5B.1: file text is REAL stored data (like RAG chunks), so file
+        # PII MUST count toward the reroute decision. Without this, file-only
+        # PII would NOT trigger the EU reroute (Invariant 1).
+        routing_text = (
+            user_text
+            + ("\n" + rag_chunk_text if rag_chunk_text else "")
+            + ("\n" + file_text if file_text else "")
+        )
         outcome = pii.contains_pii(routing_text, settings)
         effective_model, eff_row = _resolve_effective_model(
             db_read,
@@ -874,9 +1059,13 @@ def chat_completions(
     # audit request_text. llm_input_for_provider is anonymised in strict, raw in
     # sovereign, so this captures exactly what left the house. The context is
     # provider-only — it is NOT persisted as a message.
-    if rag_context_msgs:
+    # Task 5B.1: the transited context now spans BOTH the RAG and the file
+    # context messages (history + rag + file + new). Audit the whole transited
+    # block — anonymised in strict, raw in sovereign.
+    if rag_context_msgs or file_context_msgs:
+        ctx_len = len(rag_context_msgs) + len(file_context_msgs)
         transited_context = llm_input_for_provider[
-            len(history) : len(history) + len(rag_context_msgs)
+            len(history) : len(history) + ctx_len
         ]
         context_audit = "\n\n".join(
             m["content"] for m in transited_context if m.get("content")
@@ -975,8 +1164,11 @@ def chat_completions(
     # streaming path uses.
     with open_txn() as db_write:
         set_workspace_context(db_write, ws)
-        if payload.conversation_id:
-            cid = payload.conversation_id
+        # existing_cid is set for a request-supplied conversation_id OR a 5B.1
+        # early-created conversation (attachment present, no prior id). In both
+        # cases reuse it — never create a second conversation.
+        if existing_cid:
+            cid = existing_cid
             if conv_pii_mode is not None:
                 chat.set_conversation_mode(db_write, cid, conv_pii_mode)
         else:
