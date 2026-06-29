@@ -196,6 +196,15 @@ Die drei ursprünglichen Punkte:
     bleibt Conversation+Anhang ohne Assistant-Message — konsistent mit der 5.1-
     Orphan-Richtung, KEINE Kompensationslogik (User kann im Chat erneut senden).
   - **Vertagt (kein Anhang-Lösch-UX, keine Quotas):** siehe Pre-Pilot-Liste.
+  - **Datei-Chip (5B.1-Anzeige, decyra-web):** zeigt die angehängte Datei als
+    Langdock-Stil-Karte (typ-farbiges Icon + Dateiname + dt. Label) an der
+    User-Nachricht. **BEWUSSTE GRENZE:** nur in der aktuellen Session sichtbar —
+    nach Reload/Konversationswechsel fehlt der Chip, weil `GET /conversations/
+    {id}` die `chat_attachments`-Info (filename/mime_type) nicht exponiert und
+    `chat_attachments` konversations- statt nachrichtengebunden ist (kein
+    `message_id`). Nachziehen = separater Task (History-Read um Anhang-Join +
+    `message_id`-Zuordnung erweitern), vertagt bis nach Kundenvalidierung.
+    **Kein Bug — Absicht.**
 - 2026-06-28: **Task 5.3 — Retrieval & Antwort (RAG, Entscheidungen / Grenzen).**
   - **Vektor-Suche:** RLS-scoped `<=>`-Cosine über document_chunks, top_k=5,
     Schwelle 0.5 (konservativ — lieber kein als schlechter Kontext). **Kein
