@@ -363,3 +363,164 @@ async def test_multipart_streaming_file_in_context(
     )
     assert r.status_code == 200, r.text
     assert "STREAM-FILE-MARKER" in _provider_blob(stub_llm)
+
+
+# ---------------------------------------------------------------------------
+# Edge-path tests (compliance review findings — Block 5B.1)
+# ---------------------------------------------------------------------------
+
+# A valid PNG header followed by junk — recognised as a binary by filetype.
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+
+# --- 9. 415 unsupported file type end-to-end ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_unsupported_file_type_returns_415(
+    client, db, make_token, stub_pii, stub_llm, settings_override
+):
+    """Attaching a PNG disguised as CSV must return 415; no DB rows, no LLM call."""
+    settings_override()
+    _org, ws = seed_org_with_owner(db, USER, "a@firma.de")
+    _seed_model(db, CHOSEN)
+    _seed_sovereign(db)
+    token = make_token(sub=USER, email="a@firma.de")
+
+    r = await client.post(
+        "/v1/chat/completions",
+        headers=_auth(token),
+        **_multipart(CHOSEN, _PNG_BYTES, filename="evil.csv", content_type="text/csv",
+                     content="fasse zusammen"),
+    )
+    assert r.status_code == 415, r.text
+    # No conversation, no attachment row, no LLM call.
+    assert db.execute(text("SELECT count(*) FROM conversations")).scalar_one() == 0
+    assert db.execute(text("SELECT count(*) FROM chat_attachments")).scalar_one() == 0
+    assert stub_llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_unsupported_file_type_txt_extension_returns_415(
+    client, db, make_token, stub_pii, stub_llm, settings_override
+):
+    """PNG bytes named .txt must also be rejected with 415 (content-sniffed, not extension-sniffed)."""
+    settings_override()
+    _org, ws = seed_org_with_owner(db, USER, "a@firma.de")
+    _seed_model(db, CHOSEN)
+    _seed_sovereign(db)
+    token = make_token(sub=USER, email="a@firma.de")
+
+    r = await client.post(
+        "/v1/chat/completions",
+        headers=_auth(token),
+        **_multipart(CHOSEN, _PNG_BYTES, filename="evil.txt", content_type="text/plain",
+                     content="fasse zusammen"),
+    )
+    assert r.status_code == 415, r.text
+    assert db.execute(text("SELECT count(*) FROM conversations")).scalar_one() == 0
+    assert db.execute(text("SELECT count(*) FROM chat_attachments")).scalar_one() == 0
+    assert stub_llm.calls == []
+
+
+# --- 10. 413 raw byte cap (max_upload_bytes) end-to-end -----------------
+
+
+@pytest.mark.asyncio
+async def test_raw_byte_cap_returns_413(
+    client, db, make_token, stub_pii, stub_llm, settings_override
+):
+    """Overriding max_upload_bytes to a tiny value and uploading more bytes returns 413.
+
+    This is the RAW byte cap (settings.max_upload_bytes), distinct from the
+    extracted-character cap (settings.max_extracted_chars) already tested in
+    test_oversize_extract_rejected_before_any_write.
+    """
+    settings_override(max_upload_bytes=50)  # 50 bytes; send ~200 bytes of text
+    _org, ws = seed_org_with_owner(db, USER, "a@firma.de")
+    _seed_model(db, CHOSEN)
+    _seed_sovereign(db)
+    token = make_token(sub=USER, email="a@firma.de")
+
+    r = await client.post(
+        "/v1/chat/completions",
+        headers=_auth(token),
+        **_multipart(CHOSEN, b"A" * 200, filename="big.txt", content_type="text/plain",
+                     content="fasse zusammen"),
+    )
+    assert r.status_code == 413, r.text
+    # No conversation, no attachment row, no LLM call.
+    assert db.execute(text("SELECT count(*) FROM conversations")).scalar_one() == 0
+    assert db.execute(text("SELECT count(*) FROM chat_attachments")).scalar_one() == 0
+    assert stub_llm.calls == []
+
+
+# --- 11. 422 for malformed / missing payload field -----------------------
+
+
+@pytest.mark.asyncio
+async def test_missing_payload_field_returns_422(
+    client, db, make_token, stub_llm, settings_override
+):
+    """A multipart request without a 'payload' form field must return 422."""
+    settings_override()
+    _org, ws = seed_org_with_owner(db, USER, "a@firma.de")
+    _seed_model(db, CHOSEN)
+    _seed_sovereign(db)
+    token = make_token(sub=USER, email="a@firma.de")
+
+    # Post multipart WITHOUT the 'payload' field — only a file.
+    r = await client.post(
+        "/v1/chat/completions",
+        headers=_auth(token),
+        files={"file": ("doc.txt", b"some text", "text/plain")},
+    )
+    assert r.status_code == 422, r.text
+    assert db.execute(text("SELECT count(*) FROM conversations")).scalar_one() == 0
+    assert stub_llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_payload_json_returns_422(
+    client, db, make_token, stub_llm, settings_override
+):
+    """A multipart request with a syntactically broken 'payload' JSON must return 422."""
+    settings_override()
+    _org, ws = seed_org_with_owner(db, USER, "a@firma.de")
+    _seed_model(db, CHOSEN)
+    _seed_sovereign(db)
+    token = make_token(sub=USER, email="a@firma.de")
+
+    r = await client.post(
+        "/v1/chat/completions",
+        headers=_auth(token),
+        files={"file": ("doc.txt", b"some text", "text/plain")},
+        data={"payload": "{not valid json!!!"},
+    )
+    assert r.status_code == 422, r.text
+    assert db.execute(text("SELECT count(*) FROM conversations")).scalar_one() == 0
+    assert stub_llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_payload_missing_required_fields_returns_422(
+    client, db, make_token, stub_llm, settings_override
+):
+    """A multipart request with valid JSON but missing required fields (model/messages) returns 422."""
+    settings_override()
+    _org, ws = seed_org_with_owner(db, USER, "a@firma.de")
+    _seed_model(db, CHOSEN)
+    _seed_sovereign(db)
+    token = make_token(sub=USER, email="a@firma.de")
+
+    import json as _json
+
+    r = await client.post(
+        "/v1/chat/completions",
+        headers=_auth(token),
+        files={"file": ("doc.txt", b"some text", "text/plain")},
+        data={"payload": _json.dumps({"temperature": 0.5})},  # missing model+messages
+    )
+    assert r.status_code == 422, r.text
+    assert db.execute(text("SELECT count(*) FROM conversations")).scalar_one() == 0
+    assert stub_llm.calls == []
