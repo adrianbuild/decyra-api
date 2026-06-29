@@ -268,10 +268,10 @@
 > Wie Langdock im Chat-Interface (Screenshot-Referenz), außer Agents/Workflows/Sprache (alle Phase 1.5).
 
 ### Task 5B.1 — Datei-Upload in Chat (Einzelanalyse)
-- [ ] Datei an einzelne Chat-Nachricht anhängen (PDF, docx, txt, xlsx, csv)
-- [ ] Unterschied zu RAG: Datei nur für diesen Chat-Kontext, nicht dauerhaft in Wissensdatenbank
-- [ ] Text/Daten extrahieren, als Kontext an Modell
-- [ ] PII-Check auch auf hochgeladene Datei
+- [x] Datei an einzelne Chat-Nachricht anhängen (PDF, docx, txt, xlsx, csv)
+- [x] Unterschied zu RAG: Datei nur für diesen Chat-Kontext, nicht dauerhaft in Wissensdatenbank
+- [x] Text/Daten extrahieren, als Kontext an Modell
+- [x] PII-Check auch auf hochgeladene Datei
 - **DoD:** Datei an Nachricht anhängen, KI antwortet darauf
 
 ### Task 5B.2 — Datenanalyse mit Chart-Generierung (Code-Interpreter)
