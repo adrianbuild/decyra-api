@@ -1,3 +1,4 @@
+import base64
 import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
@@ -1293,20 +1294,30 @@ def _run_chat_turn(
             anonymized=anonymized,
             pii_mode=mode,
         )
-        # Sub-Task 5 builds the real chart-in-response envelope + persistence;
-        # Sub-Task 6 the audit event. For Sub-Task 4 we return a minimal,
-        # data-free response that lets callers/tests assert success/failure and
-        # chart presence. On final failure -> HTTP 200 with an error field, NOT a
-        # 500 (no exception bubbles to the endpoint).
+        # Sub-Task 5 — chart-in-chat-response envelope (API contract).
+        # Three invariants hold BY CONSTRUCTION here and are proven in
+        # tests/test_analysis_chart.py:
+        #  1. The chart NEVER goes back to the LLM. This branch returns EARLY
+        #     right below with no further LLM call; the only complete_fn calls
+        #     are the codegen attempts (built from the SCHEMA, never the chart).
+        #     The PNG comes OUT of the sandbox and goes straight to the user.
+        #  2. No raw chart at rest / in audit: this branch persists NOTHING (no
+        #     messages row, no chat_attachments, no audit event). The chart
+        #     lives ONLY in the HTTP body below. (Sub-Task 6 adds an audit event
+        #     carrying a HASH, not the bytes.)
+        #  3. On final failure -> HTTP 200 with a friendly error field, NOT a
+        #     500 (no exception bubbles to the endpoint), and the raw box output
+        #     never reaches a user-facing field.
         out: dict = {
             "object": "chat.completion",
             "model": effective_model,
             "decyra": status_block,
         }
         if codegen.ok:
-            import base64 as _b64
-
-            out["decyra"]["chart_png_b64"] = _b64.b64encode(
+            # The chart envelope: the sandbox-rendered PNG, base64-encoded, goes
+            # ONLY into this HTTP response field. It is never re-sent to the LLM
+            # and never persisted (see invariants above).
+            out["decyra"]["chart_png_b64"] = base64.b64encode(
                 codegen.chart_png
             ).decode()
             out["choices"] = [
