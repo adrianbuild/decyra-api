@@ -67,6 +67,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Push provider keys from Settings into os.environ so litellm finds
     # them. Without this litellm has no credentials.
     configure_litellm()
+    # Task 5B.2: sweep any sandbox containers orphaned by a previous crash.
+    # Best-effort: a missing/unavailable Docker daemon must never block startup.
+    try:
+        from app.sandbox.reaper import reap_orphans
+
+        reaped = reap_orphans()
+        if reaped:
+            logger.info("sandbox reaper removed %d orphaned container(s)", reaped)
+    except Exception:
+        logger.debug("sandbox reaper skipped (docker unavailable)", exc_info=True)
     yield
 
 
