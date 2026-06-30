@@ -275,11 +275,11 @@
 - **DoD:** Datei an Nachricht anhängen, KI antwortet darauf
 
 ### Task 5B.2 — Datenanalyse mit Chart-Generierung (Code-Interpreter)
-- [ ] Sandbox für Code-Ausführung (isolierter Docker-Container, kein Netzwerk, Zeitlimit)
-- [ ] Excel/CSV hochladen → KI schreibt Python (pandas) → in Sandbox ausführen
-- [ ] Chart-Rendering (matplotlib) → Bild zurück in den Chat
-- [ ] Sicherheit: Sandbox ohne Dateisystem-/Netzwerkzugriff, Ressourcen-Limit
-- [ ] Fehler-Handling wenn Code fehlschlägt (Retry/Meldung)
+- [x] Sandbox für Code-Ausführung (isolierter Docker-Container, kein Netzwerk, Zeitlimit)
+- [x] Excel/CSV hochladen → KI schreibt Python (pandas) → in Sandbox ausführen
+- [x] Chart-Rendering (matplotlib) → Bild zurück in den Chat
+- [x] Sicherheit: Sandbox ohne Dateisystem-/Netzwerkzugriff, Ressourcen-Limit
+- [x] Fehler-Handling wenn Code fehlschlägt (Retry/Meldung)
 - [ ] Test: Excel hochladen, "zeige Umsatz pro Quartal als Balkendiagramm" → korrektes Chart
 - **DoD:** Datei → Analyse → Diagramm im Chat, Sandbox sicher isoliert
 - *Achtung: aufwändigster Task im MVP, sicherheitskritisch. Eigene Session, ggf. mehrere.*

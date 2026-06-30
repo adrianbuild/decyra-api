@@ -3,13 +3,16 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 5B — Chat-Features**: 5B.1 (Datei-Upload in Chat, Einzelanalyse)
-abgeschlossen. **206 Tests grün** + Live-Smoke (beide PII-Modi, Re-Injektion
-Turn 2, „dauerhaft speichern"→RAG) gegen echtes Postgres/Presidio/Mistral.
-Auf `main` gemergt (api + web). Nächste offene Tasks: die übrigen 5B-Punkte
-(5B.2 Datenanalyse/Charts, 5B.3 Vision, 5B.4 Bildgen, 5B.5 Prompt Library,
-5B.6 Projects) + der Company-Knowledge-Toggle (WORKPLAN Z. 326).
-**Block 5 (RAG) davor KOMPLETT** (5.1+5.2+5.3); **Block 4 KOMPLETT** (4.1–4.6).
+**Block 5B — Chat-Features**: 5B.2 (Datenanalyse / Code-Interpreter) IMPLEMENTIERT
+auf Branch `feat/5b2-code-interpreter` (noch NICHT gepusht/gemergt). **280 Tests
+grün**, davon **18 Integrationstests LIVE gegen einen echten Docker-Container**
+(Sandbox-Isolation S1–S5 + echter Code-in-Box). Sicherheits-Befunde, die vier
+geschlossenen PII-Türen und der **PRE-PILOT-BLOCKER** stehen unten in „Security-
+Härtung vor Pilot". **Offen vor Merge:** Live-Smoke mit echtem LLM (Excel →
+„Umsatz pro Quartal als Balken" → korrektes Chart, WORKPLAN Z. 283) + Push-
+Freigabe. 5B.1 davor abgeschlossen (auf `main`). Nächste 5B-Punkte: 5B.3 Vision,
+5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects + Company-Knowledge-Toggle
+(WORKPLAN Z. 326). **Block 5 (RAG) KOMPLETT** (5.1+5.2+5.3); **Block 4 KOMPLETT**.
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
@@ -18,7 +21,7 @@ Auf `main` gemergt (api + web). Nächste offene Tasks: die übrigen 5B-Punkte
 - [x] Block 3 — Audit-Log ([x] 3.1 Hash-Chain, [x] 3.2 Verify-Endpoints; async Write nach 4.3 verschoben)
 - [x] Block 4 — Routing/Chat/PII ([x] 4.1 Phase A; [x] 4.2 Chat-Frontend; [x] 4.3 Chat-Proxy + Konversationen + Audit-Producer; [x] 4.4 Streaming; [x] 4.5a PII-Erkennung + Sovereign-Routing; [x] 4.5b Strict-Modus; [x] 4.6 Fehler/Fallback)
 - [x] Block 5 — RAG ([x] 5.1 Upload & Text-Extraktion; [x] 5.2 Embeddings; [x] 5.3 Retrieval)
-- [~] Block 5B — Chat-Features ([x] 5B.1 Datei-Upload; [ ] 5B.2 Datenanalyse+Charts, [ ] 5B.3 Vision, [ ] 5B.4 Bildgen, [ ] 5B.5 Prompt Library, [ ] 5B.6 Projects)
+- [~] Block 5B — Chat-Features ([x] 5B.1 Datei-Upload; [~] 5B.2 Datenanalyse+Charts (Branch, Code+Tests grün, Live-Smoke offen), [ ] 5B.3 Vision, [ ] 5B.4 Bildgen, [ ] 5B.5 Prompt Library, [ ] 5B.6 Projects)
 - [ ] Block 6 — Frontend (6.1 Chat, 6.2 Dashboard Logs, 6.3 Dashboard Verwaltung)
 - [ ] Block 7 — Extension (7.1 Grundgerüst, 7.2 ChatGPT-Integration)
 - [ ] Block 8 — Deployment & Pilot (8.1 Deploy, 8.2 Doku, 8.3 Go-Live)
@@ -119,6 +122,69 @@ Eigenschaften, vor Pilot bewerten):
     eines Anhangs (nur Cascade bei Chat-Löschung); keine Pro-Workspace-Quota auf
     Anzahl/Gesamtgröße von `chat_attachments`. Wie bei den Dokument-Quotas (5.1)
     bewusst vertagt — vor Pilot ergänzen.
+
+### Code-Interpreter / Datenanalyse (5B.2) — Sandbox-Sicherheit (PROMINENT)
+Decyra führt hier ERSTMALS LLM-generierten Code aus — kategorisch neue
+Angriffsfläche. Die Isolation (S1–S5) ist mit **14 Integrationstests LIVE gegen
+einen echten Docker-Container** bewiesen (Netz geblockt, kein Host-FS, read-only
+rootfs, non-root uid 5000, Timeout-Kill, OOM-Kill, PID-Limit, ephemer + Reaper)
++ 4 Codegen-Integrationstests (echter Code + echte Datei durch die Box). Harte
+Flags: `--network none --read-only --tmpfs /tmp + /dev/shm(bounded)
+--memory==--memory-swap --pids-limit --cpus --cap-drop ALL
+--security-opt no-new-privileges --user 5000 --rm` + force-remove im finally +
+Startup-Reaper. Der Datenkanal ist eng: Eingabe-Bytes + Code NUR über das
+stdin-Bundle des Runners rein, Chart als base64 raus — kein Host-Mount.
+
+- **‼️ PRE-PILOT-BLOCKER (HARTES Gate, vor erstem echten Kunden): Prod-Sandbox-
+  Isolation.** Das Dev-Setup ruft den lokalen Docker-Daemon direkt — das ist
+  NICHT produktionssicher. Vor Pilot MUSS die `SandboxRunner`-Prod-Implementierung
+  stehen: **separater Sandbox-Host / dedizierter Daemon, KEIN `docker.sock` im
+  App-Container** (ein Socket-Mount ist root-äquivalent auf dem Host und hebelt
+  die GANZE Isolation aus). Optional gVisor/Firecracker für echten Kernel-
+  Boundary. Ohne diesen Schritt darf KEIN echter Kunde den Code-Interpreter
+  nutzen. Das Interface (`SandboxRunner`-Abstraktion) ist bereits eingezogen,
+  damit Dev (lokaler Daemon) und Prod hinter einer Naht differieren.
+- **runc-Restrisiko (kein harter Kernel-Boundary).** Die Sandbox nutzt runc =
+  Namespace-/cgroup-Isolation, KEINE VM-Grenze. Ein Kernel-Exploit (Local
+  Privilege Escalation im Host-Kernel) könnte THEORETISCH ausbrechen; alle
+  getesteten Angriffe (Netz/FS/OOM/PID/Fork-Bombe) sind aber zuverlässig
+  contained. **User-Namespace-Remapping ist NICHT aktiv** (Container-uid 5000 =
+  Host-uid 5000) — hier unkritisch, weil read-only rootfs + kein Host-Mount,
+  aber bei künftigen Features mit Host-Pfaden NEU zu bewerten. Härtung =
+  gVisor/Firecracker auf dem Prod-Sandbox-Host (siehe Blocker).
+- **Host-Concurrency-Limit.** `sandbox_max_concurrency` (Default 2) kappt
+  parallele Container; viele gleichzeitige Ausführungen würden sonst den Host
+  erschöpfen (CPU/RAM). Vor Pilot an echter Last/Hardware kalibrieren.
+- **Out-of-Band-Ergebniskanal (Forge-Schutz — live gefunden + geschlossen).**
+  Erster Entwurf stempelte Status/Chart mit einem Per-Run-Nonce IN-BAND auf
+  stdout. Adversarialer Code konnte den Nonce per Stack-Introspektion
+  (`sys._getframe`) aus dem Parent-Frame klauen und ein gefälschtes „ok" +
+  beliebige Bytes als „Chart" zurückschicken (live als VULNERABLE bewiesen).
+  Fix: User-Code läuft als SEPARATER Kindprozess (kennt den Nonce nie, stdout
+  gepiped) — der Parent leitet den Status NUR aus Exit-Code + PNG-Magic ab.
+  Nötig, weil ein fälschbarer Erfolgs-/Chart-Kanal S5 (kontrollierter Kanal) und
+  S7 (Audit-Integrität: gefälschtes „ok" + Chart-Hash käme ins Audit) unterläuft.
+  Wächter: `test_sandbox_result_channel_is_unforgeable` + Codegen-Integrationstests
+  mit echter Datei.
+- **Die VIER geschlossenen PII-Türen (Souveränitäts-Argument vor einem Bank-
+  Sicherheitsverantwortlichen).** Der Code-Interpreter SIEHT echte (PII-haltige)
+  Daten, aber sie verlassen das System nicht (kein Netz, S1) — und keiner der
+  vier Rückkanäle leakt sie an die Cloud:
+  1. **Schema-Tür (S6):** Nur Spaltennamen + dtypes + Zeilenzahl gehen ans LLM,
+     NIE Zellwerte. Die Spaltennamen sind die 5. Quelle und laufen durch denselben
+     Routing/Anonymisierungs-Chokepoint wie User/Historie/RAG/Datei (Sovereign-
+     Reroute bzw. Strict-Platzhalter mit Koreferenz).
+  2. **Traceback-Tür:** Ein pandas-Fehler zitiert oft die fehlerhafte Datenzeile.
+     Das Retry-Feedback ans LLM ist daher schema-sicher KONSTRUIERT (nur
+     Exception-Klasse + Code-Zeilennummer), NIE der rohe Traceback/Zellwert.
+  3. **Chart-Tür:** Das gerenderte Chart (aus echten Daten) geht NUR an den User,
+     NIE zurück ans LLM (kein Vision-/„beschreibe das Chart"-Schritt) — sonst
+     wäre es erneute Cloud-Exposition durch die Bild-Tür.
+  4. **Audit-Tür:** `code_execution_events` speichert den GENERIERTEN Code (in
+     Strict mit Platzhaltern → keine rohe PII-at-rest), das Chart als SHA-256-
+     HASH (nicht das Bild), append-only via Grant. Die De-Anon-Map wird NIE
+     gespeichert (sonst reversibel). Konsistent mit der 5.3-Invariante und der
+     Strict-`audit_events`-Logik (Kette hält nur Anonymisiertes).
 
 NEU offen aus 2.3:
 
