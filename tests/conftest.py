@@ -31,9 +31,25 @@ Auth (JWKS/ES256):
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
+
+
+def _docker_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    try:
+        import docker
+
+        docker.from_env().ping()
+        return True
+    except Exception:
+        return False
+
+
+DOCKER_AVAILABLE = _docker_available()
 
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
@@ -66,6 +82,37 @@ from app.config import get_settings  # noqa: E402
 from app.main import app, get_db, get_db_write, get_write_txn  # noqa: E402
 
 TEST_ISSUER = f"{get_settings().supabase_url}/auth/v1"
+
+requires_docker = pytest.mark.skipif(
+    not DOCKER_AVAILABLE,
+    reason="real Docker daemon required for sandbox isolation proofs",
+)
+
+
+@pytest.fixture
+def stub_sandbox(monkeypatch):
+    """Mock the SandboxRunner so non-integration tests never start a container.
+    The controller lets a test set the returned result or force a failure."""
+    from app.sandbox import runner as runner_mod
+
+    class _Stub:
+        def __init__(self):
+            self.state = {"status": "ok", "chart_png": b"\x89PNG_stub", "output": ""}
+            self.calls = []
+
+        def run(self, *, file_bytes, filename, code):
+            self.calls.append({"filename": filename, "code": code})
+            return runner_mod.SandboxResult(
+                status=self.state["status"],
+                chart_png=self.state["chart_png"]
+                if self.state["status"] == "ok"
+                else None,
+                output=self.state["output"],
+            )
+
+    stub = _Stub()
+    monkeypatch.setattr(runner_mod, "get_sandbox_runner", lambda settings: stub)
+    return stub
 
 
 @pytest.fixture(scope="session")
