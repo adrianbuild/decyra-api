@@ -2,3 +2,6 @@
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "integration: requires a real Docker daemon (sandbox isolation proofs); skipped if unavailable",
+]

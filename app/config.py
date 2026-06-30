@@ -78,6 +78,15 @@ class Settings(BaseSettings):
     rag_top_k: int = 5
     rag_similarity_threshold: float = 0.5
 
+    # Code-Interpreter sandbox (Task 5B.2). Image is prebuilt+pinned; runtime has no network.
+    sandbox_image: str = "decyra-sandbox:0.1.0"
+    sandbox_mem_limit: str = "512m"
+    sandbox_pids_limit: int = 128
+    sandbox_nano_cpus: int = 1_000_000_000  # 1.0 CPU
+    sandbox_timeout_seconds: float = 20.0
+    sandbox_max_concurrency: int = 2
+    sandbox_tmpfs_size: str = "64m"
+
 
 @lru_cache
 def get_settings() -> Settings:
