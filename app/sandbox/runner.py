@@ -154,18 +154,30 @@ class DockerSandboxRunner(SandboxRunner):
     @staticmethod
     def _parse(logs: str, nonce: str, returncode: int) -> SandboxResult:
         # Only nonce-stamped sentinels are honoured (S5 result-channel integrity).
+        # In the out-of-band model these are emitted EXCLUSIVELY by the trusted
+        # container parent (bootstrap PID 1), which derives the status from the
+        # user child's PROCESS RESULT — never from what the child printed. The
+        # child runs in a separate process with a curated env and a PIPE'd stdout,
+        # so it never sees the nonce and can't reach the real stdout: it cannot
+        # forge a sentinel the runner would honour. The child's traceback is
+        # re-emitted by the parent as plain text AFTER the status line (retry
+        # feedback) and is parent-controlled framing, not a trusted result.
         status_prefix = f"<<<DECYRA_STATUS:{nonce}>>>"
         chart_begin = f"<<<DECYRA_CHART_B64:{nonce}>>>"
         chart_end = f"<<<DECYRA_CHART_END:{nonce}>>>"
 
         status = "error"
+        # Prefer the parent-emitted status line whenever it is present.
         if status_prefix in logs:
             status = logs.split(status_prefix, 1)[1].splitlines()[0].strip()
         elif returncode == 137:
-            # docker run returns 128+SIGKILL(9) when the container is OOM- or
-            # force-killed (e.g. the --memory cap fires). Surface it positively
-            # so the memory-bomb proof is a real assertion, not the silent
-            # "no status line → error" default.
+            # docker run returns 128+SIGKILL(9) when the CONTAINER ITSELF is OOM-
+            # or force-killed (e.g. the OOM-killer reaps PID 1 instead of the
+            # child, or the timeout-kill path). With no parent status line this is
+            # the only signal we have, so surface it positively as "killed" rather
+            # than the silent "no status line → error" default. (The common
+            # memory-bomb path instead kills the CHILD with SIGKILL → the parent
+            # survives and emits status "killed" via the line above.)
             return SandboxResult("killed", None, logs)
 
         png = None

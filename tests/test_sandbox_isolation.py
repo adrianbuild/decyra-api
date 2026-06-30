@@ -29,15 +29,55 @@ def test_sandbox_runs_trivial_code_returns_chart():  # S5 happy path
     assert res.chart_png and res.chart_png[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_sandbox_result_channel_is_unforgeable():  # CRITICAL — per-run nonce
-    """User/LLM code must not be able to forge the result channel.
+def test_sandbox_result_channel_is_unforgeable():  # CRITICAL — out-of-band channel
+    """User/LLM code must not be able to forge the result channel — including via
+    STACK INTROSPECTION, the strong attack the in-band design fell to.
 
-    Attack: print a status line and a chart block carrying the OLD (nonce-less)
-    sentinels — and a guessed/wrong nonce — straight to the same stdout the
-    runner parses. With a per-run nonce the runner only honours sentinels
-    bearing the exact nonce IT generated for this run (the nonce is never
-    exposed to user-code globals), so the forgery must be ignored: no fake
-    'ok', no attacker bytes accepted as the chart."""
+    In the OLD in-band design the per-run nonce lived in ``bootstrap.main()``'s
+    frame while user code ran via ``exec`` in the SAME process, so adversarial
+    code could walk the call stack with ``sys._getframe`` and recover the nonce,
+    then forge a nonce-stamped ``status=ok`` + chart straight to the real stdout
+    the runner parses. (Confirmed: it returned status='ok', chart=b'FORGED'.)
+
+    The fix runs the user code in a SEPARATE child process with a curated env
+    (no nonce) and a PIPE'd stdout: the child cannot recover the nonce (it is not
+    in its frame, env, or any file it can read) and cannot reach the container's
+    real stdout. So the forged sentinels must be ignored: no fake 'ok', no
+    attacker bytes accepted as the chart."""
+    # --- The STRONG attack: recover the parent's nonce via the call stack and
+    # emit a fully nonce-stamped forgery, flushing before os._exit so nothing is
+    # lost to buffering. Under the out-of-band model the stack walk runs in the
+    # CHILD and finds no 'nonce' anywhere, so n is None and the sentinels are
+    # un-stamped → the runner never honours them.
+    introspection = textwrap.dedent(
+        """
+        import sys, base64, os
+        n = None
+        f = sys._getframe(0)
+        while f is not None:
+            if 'nonce' in f.f_locals:
+                n = f.f_locals['nonce']
+                break
+            f = f.f_back
+        sys.stdout.write(f'<<<DECYRA_STATUS:{n}>>>ok\\n')
+        sys.stdout.write(
+            f'<<<DECYRA_CHART_B64:{n}>>>'
+            + base64.b64encode(b'FORGED').decode()
+            + f'<<<DECYRA_CHART_END:{n}>>>\\n'
+        )
+        sys.stdout.flush()
+        os._exit(0)
+        """
+    )
+    res = _runner().run(file_bytes=CSV, filename="d.csv", code=introspection)
+    # The forgery must NOT be honoured: the child exited 0 with no real PNG.
+    assert res.status != "ok", res.output
+    assert res.status == "no_chart", res.output
+    # The forged b'FORGED' bytes must never be accepted as the chart.
+    assert res.chart_png is None, res.output
+
+    # --- Keep the NAIVE forgery too: nonce-less and wrong-nonce sentinels printed
+    # straight to stdout must also be ignored.
     forged = (
         "print('<<<DECYRA_STATUS>>>ok')\n"
         "print('<<<DECYRA_STATUS:deadbeef>>>ok')\n"
