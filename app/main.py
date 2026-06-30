@@ -518,6 +518,10 @@ class ChatCompletionRequest(BaseModel):
     # user question retrieves workspace document chunks injected as provider-only
     # context. Default off — not every chat needs RAG.
     use_company_knowledge: bool = False
+    # Task 5B.2: opt-in code-interpreter / data analysis. When true AND a file is
+    # uploaded, the bytes take the TRANSIENT analysis path (validated + held in
+    # memory for the request, never persisted as a chat_attachment). Default off.
+    use_code_interpreter: bool = False
 
 
 _VALID_PII_MODES = ("sovereign", "strict")
@@ -891,6 +895,45 @@ def _run_chat_turn(
             if chunks:
                 rag_context_msgs = [retrieval.build_context_message(chunks)]
                 rag_chunk_text = retrieval.chunk_join(chunks)
+
+    # --- Analysis intake (Task 5B.2): TRANSIENT raw-byte channel, NO persist --
+    # When use_code_interpreter is set AND a file is uploaded, the bytes take the
+    # analysis path: validated (content-sniffed to the XLSX/TXT-CSV allow-list,
+    # PDF/DOCX -> 415; the streaming max_upload_bytes cap already fired upstream
+    # -> 413) and held IN MEMORY for this request only. They are deliberately
+    # NOT written to chat_attachments and create NO conversation row — the file
+    # later reaches the sandbox via the runner's controlled stdin bundle, never a
+    # host mount or new persistent storage. This branch diverges BEFORE the 5B.1
+    # persistence path below. Sub-Tasks 3-5 extend the response with schema-only
+    # routing, codegen and the chart; here it returns a minimal "accepted for
+    # analysis" envelope so the contract is testable in isolation.
+    _ANALYSIS_ALLOWED = (documents.XLSX_MIME, documents.TXT_MIME)
+    if payload.use_code_interpreter and attachment_bytes is not None:
+        try:
+            analysis_mime = documents.sniff_mime(attachment_bytes)
+        except documents.UnsupportedType:
+            raise HTTPException(
+                status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="unsupported file type for analysis (allowed: XLSX, TXT/CSV)",
+            )
+        if analysis_mime not in _ANALYSIS_ALLOWED:
+            # PDF/DOCX are valid chat attachments but NOT analysable here.
+            raise HTTPException(
+                status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="unsupported file type for analysis (allowed: XLSX, TXT/CSV)",
+            )
+        analysis_fname = documents.sanitize_filename(attachment_filename)
+        # Bytes stay in memory (attachment_bytes); discarded when this request
+        # returns. No insert_attachment, no conversation create, no disk write.
+        return {
+            "decyra": {
+                "analysis": {
+                    "filename": analysis_fname,
+                    "mime": analysis_mime,
+                    "size_bytes": len(attachment_bytes),
+                }
+            }
+        }
 
     # --- File attachment (Task 5B.1): PROVIDER-ONLY 4th context source -------
     # Order (user sharpenings): extract + CAP the new upload BEFORE any DB write,
