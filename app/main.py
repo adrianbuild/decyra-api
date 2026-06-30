@@ -23,6 +23,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
 from app import (
+    analysis,
     attachments,
     chat,
     documents,
@@ -59,6 +60,15 @@ _PROVIDER_ERROR_MSG = "Modell-Provider-Fehler."
 _FILE_CONTEXT_HEADER = (
     "Kontext aus vom Nutzer in diesem Chat angehängten Dateien. Beziehe dich "
     "bei der Antwort auf diese Dateien, wenn sie relevant sind."
+)
+
+# Task 5B.2: header for the PROVIDER-ONLY schema-context message (the FIFTH
+# content source, mirroring _FILE_CONTEXT_HEADER). It carries ONLY the table
+# structure — column names, dtypes, row count — never any cell value, and flows
+# through the same PII gate as the other sources.
+_SCHEMA_CONTEXT_HEADER = (
+    "Schema der zur Analyse hochgeladenen Datei (nur Spaltennamen, Datentypen "
+    "und Zeilenzahl — keine Zellwerte)."
 )
 
 
@@ -903,11 +913,24 @@ def _run_chat_turn(
     # -> 413) and held IN MEMORY for this request only. They are deliberately
     # NOT written to chat_attachments and create NO conversation row — the file
     # later reaches the sandbox via the runner's controlled stdin bundle, never a
-    # host mount or new persistent storage. This branch diverges BEFORE the 5B.1
-    # persistence path below. Sub-Tasks 3-5 extend the response with schema-only
-    # routing, codegen and the chart; here it returns a minimal "accepted for
-    # analysis" envelope so the contract is testable in isolation.
+    # host mount or new persistent storage. This branch is mutually exclusive
+    # with the 5B.1 persistence path below. Sub-Task 3 (this task): extract the
+    # SCHEMA only, build a provider-only schema-context message + schema text,
+    # then let control flow CONTINUE into the existing routing so the schema
+    # passes through the same PII gate as the four other sources. Codegen +
+    # sandbox run (Sub-Task 4) and the chart in the response (Sub-Task 5) build
+    # on top of this; they are not implemented here.
     _ANALYSIS_ALLOWED = (documents.XLSX_MIME, documents.TXT_MIME)
+    # Task 5B.2 Sub-Task 3: the schema info (column names + dtypes + row count,
+    # NO cell values) is the FIFTH content source. It is wired EXACTLY like the
+    # 5B.1 file_context_msgs/file_text pair so it traverses the SAME PII
+    # chokepoint: strict anonymises the schema block in place (shared map ->
+    # coreference with the user text), sovereign counts schema PII toward the
+    # EU reroute. These defaults keep both vars defined for the non-analysis
+    # path (then they contribute nothing).
+    is_analysis = False
+    schema_context_msgs: list[dict] = []
+    schema_text = ""
     if payload.use_code_interpreter and attachment_bytes is not None:
         try:
             analysis_mime = documents.sniff_mime(attachment_bytes)
@@ -923,17 +946,29 @@ def _run_chat_turn(
                 detail="unsupported file type for analysis (allowed: XLSX, TXT/CSV)",
             )
         analysis_fname = documents.sanitize_filename(attachment_filename)
-        # Bytes stay in memory (attachment_bytes); discarded when this request
-        # returns. No insert_attachment, no conversation create, no disk write.
-        return {
-            "decyra": {
-                "analysis": {
-                    "filename": analysis_fname,
-                    "mime": analysis_mime,
-                    "size_bytes": len(attachment_bytes),
-                }
-            }
-        }
+        # Schema-ONLY extraction: pandas parses the user's own bytes in this
+        # trusted process (like the 5B.1 openpyxl extract) purely for column
+        # names + dtypes + row count; all cell VALUES are discarded here and
+        # never enter the prompt, the LLM payload, or storage. The bytes stay
+        # in memory (attachment_bytes) for the later sandbox run; NO
+        # insert_attachment, NO conversation create from this branch, NO disk
+        # write.
+        try:
+            schema = analysis.extract_schema(analysis_fname, attachment_bytes)
+        except Exception:  # noqa: BLE001 — a corrupt/unreadable table
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="file could not be analysed (corrupt or unreadable table)",
+            )
+        schema_text = analysis.schema_for_prompt(schema)
+        # Provider-only context message, mirroring file_context_msgs: it is sent
+        # to the LLM and audited but never persisted as a chat message.
+        schema_context_msgs = [
+            {"role": "system", "content": _SCHEMA_CONTEXT_HEADER + "\n\n" + schema_text}
+        ]
+        is_analysis = True
+        # Do NOT return: control flow continues into the existing routing so the
+        # schema traverses the same PII gate as the four other content sources.
 
     # --- File attachment (Task 5B.1): PROVIDER-ONLY 4th context source -------
     # Order (user sharpenings): extract + CAP the new upload BEFORE any DB write,
@@ -944,7 +979,11 @@ def _run_chat_turn(
     # still sees the stored file). The text flows into llm_input -> full_text ->
     # strict anonymisation/coreference are automatic, and into routing_text ->
     # sovereign reroute fires on file-only PII.
-    if attachment_bytes is not None:
+    # Task 5B.2: analysis and 5B.1-persist are MUTUALLY EXCLUSIVE. An analysis
+    # upload's bytes are used ONLY for schema (extracted above and discarded);
+    # they are never extracted+stored as a chat attachment, so the persist path
+    # is skipped entirely for analysis requests.
+    if attachment_bytes is not None and not is_analysis:
         try:
             att_mime = documents.sniff_mime(attachment_bytes)
         except documents.UnsupportedType:
@@ -1005,7 +1044,17 @@ def _run_chat_turn(
             ]
             file_text = "\n".join(a.extracted_text for a in atts)
 
-    llm_input = history + rag_context_msgs + file_context_msgs + new_messages
+    # Task 5B.2: schema_context_msgs is the FIFTH content source, inserted in
+    # the same provider-only context block as RAG + file context (before the
+    # new user turn). In strict mode anonymize_messages then masks PII in the
+    # schema block automatically and in the SAME shared map as the user text.
+    llm_input = (
+        history
+        + rag_context_msgs
+        + file_context_msgs
+        + schema_context_msgs
+        + new_messages
+    )
 
     # --- PII check on the FULL llm_input (history + new) — Invariant 1 ---
     # The whole input is scanned in BOTH modes: history is re-sent, so a later
@@ -1094,10 +1143,15 @@ def _run_chat_turn(
         # Task 5B.1: file text is REAL stored data (like RAG chunks), so file
         # PII MUST count toward the reroute decision. Without this, file-only
         # PII would NOT trigger the EU reroute (Invariant 1).
+        # Task 5B.2: schema text is REAL stored data about the user's file (like
+        # RAG chunks and file text), so PII in a column name MUST count toward
+        # the reroute decision. Append it mirroring file_text — without this a
+        # column name that is the SOLE PII trigger would not reroute (S6).
         routing_text = (
             user_text
             + ("\n" + rag_chunk_text if rag_chunk_text else "")
             + ("\n" + file_text if file_text else "")
+            + ("\n" + schema_text if schema_text else "")
         )
         outcome = pii.contains_pii(routing_text, settings)
         effective_model, eff_row = _resolve_effective_model(
@@ -1115,8 +1169,14 @@ def _run_chat_turn(
     # Task 5B.1: the transited context now spans BOTH the RAG and the file
     # context messages (history + rag + file + new). Audit the whole transited
     # block — anonymised in strict, raw in sovereign.
-    if rag_context_msgs or file_context_msgs:
-        ctx_len = len(rag_context_msgs) + len(file_context_msgs)
+    # Task 5B.2: the transited context block now spans RAG + file + schema
+    # context (history + rag + file + schema + new). Include schema in ctx_len
+    # so the slice still lines up and the schema context is captured in the
+    # audit (anonymised in strict, raw in sovereign) — preserving Invariant 5.
+    if rag_context_msgs or file_context_msgs or schema_context_msgs:
+        ctx_len = (
+            len(rag_context_msgs) + len(file_context_msgs) + len(schema_context_msgs)
+        )
         transited_context = llm_input_for_provider[
             len(history) : len(history) + ctx_len
         ]

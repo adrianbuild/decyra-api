@@ -99,7 +99,13 @@ async def test_analysis_does_not_persist_attachment(
     assert rows == 0
 
 
-# --- 2. accepts CSV: minimal analysis-accepted response shape ----------
+# --- 2. accepts CSV: schema flows to the LLM, file stays transient -----
+# Sub-Task 3 replaced the Sub-Task 2 "accepted for analysis" placeholder
+# envelope: the request now flows through the normal chat-completion path with
+# the schema as the fifth (provider-only) context source. The load-bearing
+# invariants of this test are unchanged — CSV is accepted (200) and the upload
+# is NEVER persisted — plus the new schema-only guarantee (columns to the LLM,
+# no cell values).
 
 
 @pytest.mark.asyncio
@@ -116,10 +122,13 @@ async def test_analysis_accepts_csv(
         **_multipart(csv, filename="u.csv", content_type="text/csv"),
     )
     assert r.status_code == 200, r.text
-    analysis = r.json()["decyra"]["analysis"]
-    assert analysis["filename"] == "u.csv"
-    assert analysis["mime"] == "text/plain"  # CSV sniffs as TXT_MIME (content-based)
-    assert analysis["size_bytes"] == len(csv)
+    # Still transient: nothing persisted to chat_attachments.
+    assert db.execute(text("SELECT count(*) FROM chat_attachments")).scalar_one() == 0
+    # Schema (column names) reached the provider; cell values did NOT.
+    blob = "\n".join(m.get("content") or "" for m in stub_llm.calls[-1]["messages"])
+    assert "q" in blob and "umsatz" in blob
+    assert "Q1" not in blob and "Q2" not in blob
+    assert "10" not in blob and "20" not in blob
 
 
 # --- 3. accepts XLSX ---------------------------------------------------
@@ -145,12 +154,12 @@ async def test_analysis_accepts_xlsx(
         ),
     )
     assert r.status_code == 200, r.text
-    analysis = r.json()["decyra"]["analysis"]
-    assert analysis["filename"] == "u.xlsx"
-    assert "spreadsheetml" in analysis["mime"]
-    assert analysis["size_bytes"] == len(xlsx)
     # still transient
     assert db.execute(text("SELECT count(*) FROM chat_attachments")).scalar_one() == 0
+    # Schema columns reached the provider; cell values did NOT.
+    blob = "\n".join(m.get("content") or "" for m in stub_llm.calls[-1]["messages"])
+    assert "q" in blob and "umsatz" in blob
+    assert "Q1" not in blob and "Q2" not in blob
 
 
 # --- 4. rejects PDF with 415 (type allow-list) -------------------------
