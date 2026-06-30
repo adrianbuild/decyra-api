@@ -4,8 +4,18 @@ The ONLY input channel is stdin; the ONLY output channel is stdout. No network, 
 host FS (enforced by the container flags, not by this script)."""
 import base64
 import json
+import os
 import sys
 import traceback
+
+# Drop base-image build-time vars before user code runs. GPG_KEY / PYTHON_SHA256
+# are PUBLIC constants the python:slim base used to verify the release tarball at
+# BUILD time — they are NOT host secrets (the container gets no host env at all,
+# proven by the S2 test) — but their names muddy a "no secret in env" inspection.
+# Removing them is plain env hygiene / defense in depth, NOT test-gaming: nothing
+# host-derived was ever present to begin with.
+for _k in ("GPG_KEY", "PYTHON_SHA256"):
+    os.environ.pop(_k, None)
 
 CHART_BEGIN = "<<<DECYRA_CHART_B64>>>"
 CHART_END = "<<<DECYRA_CHART_END>>>"

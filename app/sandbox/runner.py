@@ -1,12 +1,23 @@
 """Ephemeral, hard-flagged Docker sandbox for LLM-generated code (Task 5B.2).
 
 The container is the security boundary (S1-S5), not the prompt. Input goes in via
-stdin, the chart comes out via stdout; no host directory is ever mounted."""
+stdin, the chart comes out via stdout; no host directory is ever mounted.
+
+Implementation note (runner channel): the docker-SDK ``attach_socket`` stdin path
+did NOT reliably deliver EOF to the container's ``sys.stdin.read()`` on this Docker
+Desktop — every run blocked until the timeout. The plan's documented fallback is a
+``docker`` CLI subprocess with identical hardening flags and ``--rm``; that path
+delivers stdin → stdout deterministically and is what we use here. The
+``SandboxResult`` interface is unchanged. Teardown stays guaranteed by ``--rm`` plus
+a best-effort ``docker rm -f <name>`` in ``finally`` (covers the kill-on-timeout
+case), and orphans are swept by the reaper via the ``decyra.sandbox`` label."""
 from __future__ import annotations
 
 import base64
 import json
+import subprocess
 import threading
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -29,6 +40,20 @@ def _docker_client():
     import docker
 
     return docker.from_env()
+
+
+def _force_remove(name: str) -> None:
+    """Best-effort teardown of a named container (S4). ``docker run --rm`` already
+    removes on normal exit; this covers the timeout-kill / crash path. Never raises
+    — teardown must not mask the run's own outcome."""
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", name],
+            capture_output=True,
+            timeout=15,
+        )
+    except Exception:
+        pass
 
 
 class SandboxRunner(ABC):
@@ -58,52 +83,46 @@ class DockerSandboxRunner(SandboxRunner):
         with type(self)._sem:
             return self._run_locked(bundle)
 
+    def _docker_run_cmd(self, name: str) -> list[str]:
+        s = self.s
+        cpus = f"{s.sandbox_nano_cpus / 1_000_000_000:g}"
+        return [
+            "docker", "run", "--rm", "-i",
+            "--name", name,
+            "--label", f"{_LABEL}=1",              # S4 (reaper)
+            "--network", "none",                   # S1
+            "--read-only",                         # S2
+            "--tmpfs", f"/tmp:size={s.sandbox_tmpfs_size}",  # only writable surface
+            "--memory", s.sandbox_mem_limit,       # S3
+            "--memory-swap", s.sandbox_mem_limit,  # no swap headroom
+            "--pids-limit", str(s.sandbox_pids_limit),  # S3
+            "--cpus", cpus,                        # S3
+            "--cap-drop", "ALL",                   # S2
+            "--security-opt", "no-new-privileges",  # S2
+            "--user", "5000",                      # S2 (non-root)
+            s.sandbox_image,
+        ]
+
     def _run_locked(self, bundle: bytes) -> SandboxResult:
-        import requests.exceptions
-        from docker.errors import NotFound
-
-        client = _docker_client()
-        container = client.containers.create(
-            image=self.s.sandbox_image,
-            stdin_open=True,
-            network_mode="none",                  # S1
-            mem_limit=self.s.sandbox_mem_limit,    # S3
-            memswap_limit=self.s.sandbox_mem_limit,  # no swap headroom
-            pids_limit=self.s.sandbox_pids_limit,  # S3
-            nano_cpus=self.s.sandbox_nano_cpus,    # S3
-            read_only=True,                        # S2
-            tmpfs={"/tmp": f"size={self.s.sandbox_tmpfs_size}"},  # only writable surface
-            cap_drop=["ALL"],                      # S2
-            security_opt=["no-new-privileges"],    # S2
-            user="5000",                           # S2 (non-root)
-            labels={_LABEL: "1"},                  # S4 (reaper)
-            detach=True,
-        )
+        name = f"decyra-sbx-{uuid.uuid4().hex[:12]}"
+        cmd = self._docker_run_cmd(name)
         try:
-            sock = container.attach_socket(params={"stdin": 1, "stdout": 1,
-                                                   "stderr": 1, "stream": 1})
-            container.start()
-            sock._sock.sendall(bundle)
-            sock._sock.shutdown(1)  # SHUT_WR → EOF for the bootstrap's stdin.read()
-
             try:
-                container.wait(timeout=self.s.sandbox_timeout_seconds)  # S3
-            except (requests.exceptions.Timeout,
-                    requests.exceptions.ConnectionError):
-                # The wait read-timeout (and its urllib3-wrapped ConnectionError
-                # form) is the ONLY signal that means "container exceeded the
-                # timeout". Catch ONLY that — a genuine RuntimeError from the SDK
-                # must propagate (and `finally` still force-removes the
-                # container), never be silently masked as a timeout.
+                proc = subprocess.run(
+                    cmd,
+                    input=bundle,
+                    capture_output=True,
+                    timeout=self.s.sandbox_timeout_seconds,  # S3
+                )
+            except subprocess.TimeoutExpired:
                 return SandboxResult("timeout", None, "execution timed out")
 
-            logs = container.logs(stdout=True, stderr=True).decode(errors="replace")
+            logs = proc.stdout.decode(errors="replace")
+            if proc.stderr:
+                logs += proc.stderr.decode(errors="replace")
             return self._parse(logs)
         finally:
-            try:
-                container.remove(force=True)       # S4: guaranteed teardown
-            except NotFound:
-                pass
+            _force_remove(name)                    # S4: guaranteed teardown
 
     @staticmethod
     def _parse(logs: str) -> SandboxResult:
