@@ -36,6 +36,7 @@ from app import (
 )
 from app import retrieval
 from app.audit import verify_workspace_chain
+from app.sandbox import runner as sandbox_runner
 from app.auth import AuthenticatedUser, get_current_user
 from app.config import Settings, get_settings
 from app.llm import configure_litellm
@@ -53,6 +54,14 @@ _BAD_REQUEST_MSG = (
     "Anfrage konnte nicht verarbeitet werden (z. B. Kontextlänge überschritten)."
 )
 _PROVIDER_ERROR_MSG = "Modell-Provider-Fehler."
+# Task 5B.2 Sub-Task 4: friendly, data-free message when the bounded codegen
+# loop could not produce a chart after max_retries. HTTP 200 (not 500) with an
+# error field — the raw traceback / cell values are NEVER surfaced to the client
+# here (they stay local, available to the user's own logs).
+_ANALYSIS_FAILED_MSG = (
+    "Die Analyse konnte kein Diagramm erzeugen. Bitte formuliere die Frage "
+    "praeziser oder pruefe die Datei und versuche es erneut."
+)
 
 # Task 5B.1: header for the PROVIDER-ONLY chat-attachment context message
 # (mirrors retrieval._CONTEXT_HEADER). The file text is sent + audited but
@@ -1208,6 +1217,120 @@ def _run_chat_turn(
         kwargs["temperature"] = payload.temperature
     if payload.max_tokens is not None:
         kwargs["max_tokens"] = payload.max_tokens
+
+    # --- Analysis codegen + bounded retry (Task 5B.2 Sub-Task 4) -------
+    # The analysis request does NOT do a single plain completion: it runs the
+    # bounded codegen loop. Each attempt asks the LLM (through the SAME gated
+    # path — complete_with_fallback over the routed/sovereign candidates, so
+    # stub_llm captures it and sovereignty/fallback hold) for pandas/matplotlib
+    # code, then runs that code in the proven Docker sandbox via the runner's
+    # stdin bundle (the file enters ONLY there — no host mount, no new path).
+    #
+    # STRICT-MODE de-anonymisation: the codegen messages are anonymised here
+    # with the SHARED anonymizer (so the schema column names become the SAME
+    # placeholders as the rest of the input — coreference), so the model writes
+    # PLACEHOLDER-column code. generate_and_run then de-anonymises the returned
+    # code with that same anonymizer before it runs in the box, so it references
+    # the REAL columns. Sovereign: anonymizer is None -> code runs as-is.
+    #
+    # SCHEMA-SAFE retry feedback: a failed run's traceback may quote a real cell
+    # value (strict ran real-column code), so generate_and_run scrubs it to the
+    # exception CLASS + the failing <generated> line only before the next LLM
+    # attempt. The raw box output never reaches the cloud.
+    if is_analysis:
+        def _complete_fn(messages: list[dict]) -> str:
+            # In strict mode mask the codegen messages through the SHARED
+            # anonymizer (column names -> the already-minted placeholders), so
+            # only placeholders transit. Sovereign sends them raw.
+            sent = messages
+            if anonymizer is not None:
+                sent = [
+                    {
+                        "role": m["role"],
+                        "content": anonymizer.anonymize(
+                            m.get("content") or "", pii.all_spans(m.get("content") or "", settings)
+                        ),
+                    }
+                    for m in messages
+                ]
+            call_kwargs = dict(kwargs)
+            call_kwargs["messages"] = sent
+            _used_model, _used_row, resp = llm_call.complete_with_fallback(
+                candidates, call_kwargs, settings, log_ctx=log_ctx
+            )
+            return resp.choices[0].message.content or ""
+
+        # Resolve through the module so the test stub (which patches
+        # app.sandbox.runner.get_sandbox_runner) is honoured.
+        runner = sandbox_runner.get_sandbox_runner(settings)
+        try:
+            # _run_chat_turn already runs in a threadpool, so the blocking
+            # sandbox run is off the event loop — call directly (no await).
+            codegen = analysis.generate_and_run(
+                schema=schema,
+                question=user_text,
+                file_bytes=attachment_bytes,
+                filename=analysis_fname,
+                complete_fn=_complete_fn,
+                runner=runner,
+                anonymizer=anonymizer,
+                max_retries=settings.sandbox_max_retries,
+            )
+        except llm_call.ProvidersUnavailable:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, detail=_PROVIDERS_UNAVAILABLE_MSG
+            )
+        except litellm.BadRequestError:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=_BAD_REQUEST_MSG)
+        except litellm.APIError:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=_PROVIDER_ERROR_MSG)
+
+        status_block = chat.pii_status(
+            pii_detected=outcome.detected,
+            pii_check=outcome.status,
+            routed_to=eff_row.provider,
+            effective_model=effective_model,
+            anonymized=anonymized,
+            pii_mode=mode,
+        )
+        # Sub-Task 5 builds the real chart-in-response envelope + persistence;
+        # Sub-Task 6 the audit event. For Sub-Task 4 we return a minimal,
+        # data-free response that lets callers/tests assert success/failure and
+        # chart presence. On final failure -> HTTP 200 with an error field, NOT a
+        # 500 (no exception bubbles to the endpoint).
+        out: dict = {
+            "object": "chat.completion",
+            "model": effective_model,
+            "decyra": status_block,
+        }
+        if codegen.ok:
+            import base64 as _b64
+
+            out["decyra"]["chart_png_b64"] = _b64.b64encode(
+                codegen.chart_png
+            ).decode()
+            out["choices"] = [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hier ist dein Diagramm.",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+            out["decyra"]["analysis_status"] = "ok"
+        else:
+            out["decyra"]["analysis_status"] = codegen.status
+            out["decyra"]["error"] = _ANALYSIS_FAILED_MSG
+            out["choices"] = [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": _ANALYSIS_FAILED_MSG},
+                    "finish_reason": "stop",
+                }
+            ]
+        return out
 
     # --- Streaming path (Task 4.4 + 4.5 + 4.6) -------------------------
     if payload.stream:

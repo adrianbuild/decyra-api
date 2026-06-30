@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     sandbox_timeout_seconds: float = 20.0
     sandbox_max_concurrency: int = 2
     sandbox_tmpfs_size: str = "64m"
+    # Sub-Task 4: bounded codegen retry attempts (LLM call + sandbox run per
+    # attempt). After this many failures the analysis returns a clean,
+    # data-free user-facing error (no exception, no 500).
+    sandbox_max_retries: int = 3
 
 
 @lru_cache
