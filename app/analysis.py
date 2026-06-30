@@ -15,9 +15,10 @@ generated code; LLM-generated code only ever runs inside the Docker sandbox.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
 import pandas as pd
@@ -181,11 +182,32 @@ class _Runnerish(Protocol):
 
 
 @dataclass(frozen=True)
+class ExecutionRecord:
+    """One sandbox run, as the audit (Sub-Task 6) records it.
+
+    ``generated_code`` is the code the LLM RETURNED for this attempt, BEFORE any
+    de-anonymisation — i.e. the placeholder-referencing code in strict mode, the
+    real-column code in sovereign. The de-anonymised ``run_code`` that actually
+    executed is DELIBERATELY not held here (storing it would put raw PII at rest
+    in the audit). ``chart_sha256`` is the hex SHA-256 of the produced chart PNG
+    when ``status == "ok"`` and a chart exists, else ``None`` — never the bytes.
+    """
+
+    generated_code: str
+    status: str
+    chart_sha256: str | None
+
+
+@dataclass(frozen=True)
 class CodegenOutcome:
     """Result of the bounded codegen+run loop. ``ok`` true => ``chart_png`` set.
     Never carries a raw traceback meant for the LLM — ``error_feedback`` is the
     last SCHEMA-SAFE feedback (safe to log); the raw box output stays in
-    ``last_output`` for USER-facing display/logging only, never the cloud."""
+    ``last_output`` for USER-facing display/logging only, never the cloud.
+
+    ``executions`` holds one ``ExecutionRecord`` per sandbox run (so a request
+    that retried twice then succeeded yields THREE records). The caller appends
+    one append-only ``code_execution_events`` row per record."""
 
     ok: bool
     chart_png: bytes | None
@@ -193,6 +215,7 @@ class CodegenOutcome:
     status: str
     error_feedback: str
     last_output: str
+    executions: list[ExecutionRecord] = field(default_factory=list)
 
 
 def generate_and_run(
@@ -225,15 +248,33 @@ def generate_and_run(
     """
     messages = build_codegen_messages(schema, question)
     last_result: SandboxResult | None = None
+    # One audit record per sandbox run (Sub-Task 6). Holds the GENERATED code
+    # (pre de-anon) — never ``run_code`` — and a chart HASH, never the bytes.
+    executions: list[ExecutionRecord] = []
 
     for attempt in range(1, max_retries + 1):
         code = complete_fn(messages)
         # STRICT-MODE de-anonymisation: placeholder columns -> real columns, with
         # the SAME anonymizer used for chat responses. Sovereign: run verbatim.
+        # ``run_code`` is what EXECUTES; it is NEVER stored — only ``code`` (the
+        # pre-de-anon generated code) is recorded in the audit.
         run_code = anonymizer.deanonymize(code) if anonymizer is not None else code
 
         result = runner.run(file_bytes=file_bytes, filename=filename, code=run_code)
         last_result = result
+
+        chart_sha256 = (
+            hashlib.sha256(result.chart_png).hexdigest()
+            if result.status == "ok" and result.chart_png is not None
+            else None
+        )
+        executions.append(
+            ExecutionRecord(
+                generated_code=code,  # PRE de-anonymisation (placeholders in strict)
+                status=result.status,
+                chart_sha256=chart_sha256,
+            )
+        )
 
         if result.status == "ok" and result.chart_png is not None:
             return CodegenOutcome(
@@ -243,6 +284,7 @@ def generate_and_run(
                 status="ok",
                 error_feedback="",
                 last_output=result.output,
+                executions=executions,
             )
 
         # Failure: append SCHEMA-SAFE feedback for the next attempt. We append it
@@ -268,4 +310,5 @@ def generate_and_run(
         if last_result is not None
         else "",
         last_output=last_result.output if last_result is not None else "",
+        executions=executions,
     )

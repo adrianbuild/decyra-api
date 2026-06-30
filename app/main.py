@@ -27,6 +27,7 @@ from app import (
     analysis,
     attachments,
     chat,
+    code_audit,
     documents,
     embeddings,
     invitations,
@@ -1341,6 +1342,27 @@ def _run_chat_turn(
                     "finish_reason": "stop",
                 }
             ]
+
+        # Sub-Task 6 — append-only audit. ONE code_execution_events row per
+        # sandbox run (so a request that retried twice then succeeded writes
+        # THREE rows). Each row stores the LLM-GENERATED code (pre de-anon:
+        # placeholders in strict, real columns in sovereign) + the run status +
+        # the chart HASH (never the bytes, never the de-anon map). This is the
+        # ONLY new persistence on the analysis path; the chart bytes still go
+        # only into the HTTP response above. ``ws`` is the resolved membership
+        # workspace (never request-derived).
+        if codegen.executions:
+            with open_txn() as db_write:
+                set_workspace_context(db_write, ws)
+                for record in codegen.executions:
+                    code_audit.insert_code_execution_event(
+                        db_write,
+                        workspace_id=ws,
+                        user_id=user.user_id,
+                        status=record.status,
+                        generated_code=record.generated_code,
+                        chart_sha256=record.chart_sha256,
+                    )
         return out
 
     # --- Streaming path (Task 4.4 + 4.5 + 4.6) -------------------------
