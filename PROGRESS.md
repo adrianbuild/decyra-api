@@ -3,16 +3,20 @@
 > Aktueller Stand. Claude Code aktualisiert das nach jeder Session. Vor jeder neuen Session zuerst lesen.
 
 ## Aktueller Task
-**Block 5B — Chat-Features**: 5B.2 (Datenanalyse / Code-Interpreter) IMPLEMENTIERT
-auf Branch `feat/5b2-code-interpreter` (noch NICHT gepusht/gemergt). **280 Tests
-grün**, davon **18 Integrationstests LIVE gegen einen echten Docker-Container**
-(Sandbox-Isolation S1–S5 + echter Code-in-Box). Sicherheits-Befunde, die vier
-geschlossenen PII-Türen und der **PRE-PILOT-BLOCKER** stehen unten in „Security-
-Härtung vor Pilot". **Offen vor Merge:** Live-Smoke mit echtem LLM (Excel →
-„Umsatz pro Quartal als Balken" → korrektes Chart, WORKPLAN Z. 283) + Push-
-Freigabe. 5B.1 davor abgeschlossen (auf `main`). Nächste 5B-Punkte: 5B.3 Vision,
-5B.4 Bildgen, 5B.5 Prompt Library, 5B.6 Projects + Company-Knowledge-Toggle
-(WORKPLAN Z. 326). **Block 5 (RAG) KOMPLETT** (5.1+5.2+5.3); **Block 4 KOMPLETT**.
+**Block 5B — Chat-Features**: 5B.2 (Datenanalyse / Code-Interpreter) FERTIG +
+LIVE-SMOKE GRÜN auf Branch `feat/5b2-code-interpreter` (noch NICHT gepusht/
+gemergt — Push-Freigabe steht aus). **282 Tests grün**, davon **18
+Integrationstests LIVE gegen einen echten Docker-Container** (Sandbox-Isolation
+S1–S5 + echter Code-in-Box). Live-Smoke bestätigt: Teil 1 (clean.csv → korrektes
+Chart, gpt-5.5), Teil 2a (Sovereign-Reroute durch Spaltennamen-PII →
+effective_model=mistral), Teil 2b (keine rohe PII im Audit, Volltext-Check),
+Teil 3 (Netz/FS/Timeout-Angriffe geblockt, 0 Orphans). Ein Cross-Cutting-Review-
+Fix eingebaut (Runner-Infra-Exception gecontaint → freundliche 200 + genau ein
+Audit-Event). Sicherheits-Befunde, die vier PII-Türen, der **PRE-PILOT-BLOCKER**
+und der Mistral-Codegen-Befund stehen unten in „Security-Härtung vor Pilot".
+5B.1 davor abgeschlossen (auf `main`). Nächste 5B-Punkte: 5B.3 Vision, 5B.4
+Bildgen, 5B.5 Prompt Library, 5B.6 Projects + Company-Knowledge-Toggle (WORKPLAN
+Z. 326). **Block 5 (RAG) KOMPLETT** (5.1+5.2+5.3); **Block 4 KOMPLETT**.
 
 ## Status der Task-Blöcke
 - [~] Block 0 — Voraussetzungen (0.2 lokale Umgebung erledigt: Node 20 via nvm, Python 3.11, Docker; 0.1 Accounts/Keys parallel)
@@ -185,6 +189,27 @@ stdin-Bundle des Runners rein, Chart als base64 raus — kein Host-Mount.
      HASH (nicht das Bild), append-only via Grant. Die De-Anon-Map wird NIE
      gespeichert (sonst reversibel). Konsistent mit der 5.3-Invariante und der
      Strict-`audit_events`-Logik (Kette hält nur Anonymisiertes).
+- **Codegen-Qualität auf dem Sovereign/EU-Modell (Live-Smoke-Befund, KEIN
+  Blocker, späterer Task):** Mistral Large schreibt aktuell keinen zuverlässig
+  brauchbaren Analyse-Code — der Code-Interpreter läuft im **Sovereign-Reroute
+  (Mistral) unzuverlässig**, während er mit einem starken Cloud-Modell (z.B.
+  gpt-5.5) korrekt Charts erzeugt. Direkte Konsequenz: **Datei-Analyse mit PII**
+  wird korrekt auf das EU-Modell geroutet (S6, im Smoke bestätigt), aber die
+  Chart-Generierung dort ist qualitativ schwächer — das berührt das
+  Souveränitäts-Versprechen (souverän UND nutzbar) genau an der sensibelsten
+  Stelle. Späterer Task: Mistral-spezifischer Codegen-Prompt (few-shot /
+  strengeres Ausgabeformat) ODER ein stärkeres EU-Modell für die Code-Generierung.
+  Sandbox-Isolation und die vier PII-Türen sind davon UNBERÜHRT (die Box hält,
+  egal was das Modell schreibt; ein untauglicher Code endet als sauberer
+  Fehler-Retry + freundliche Meldung).
+- **Robustheit Analyse-Fehlerpfad (Cross-Cutting-Review-Fix):** eine
+  Nicht-Timeout-Exception des Sandbox-Runners (z.B. `docker` nicht spawnbar) wird
+  jetzt in `generate_and_run` als `infra_error` gecontaint → freundliche HTTP 200
+  (kein 500 / kein roher Exception-String) **und** genau ein
+  `code_execution_events`-Eintrag (Status `infra_error`, generierter Code, keine
+  rohe Exception at-rest). Relevant genau wegen des Prod-Sandbox-Blockers: bei
+  entkoppeltem Sandbox-Host ist „Runner nicht erreichbar" ein realistischer
+  Zustand. Wächter: `test_endpoint_runner_infra_error_contained_one_event`.
 
 NEU offen aus 2.3:
 

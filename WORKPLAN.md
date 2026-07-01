@@ -280,7 +280,7 @@
 - [x] Chart-Rendering (matplotlib) → Bild zurück in den Chat
 - [x] Sicherheit: Sandbox ohne Dateisystem-/Netzwerkzugriff, Ressourcen-Limit
 - [x] Fehler-Handling wenn Code fehlschlägt (Retry/Meldung)
-- [ ] Test: Excel hochladen, "zeige Umsatz pro Quartal als Balkendiagramm" → korrektes Chart
+- [x] Test: Excel hochladen, "zeige Umsatz pro Quartal als Balkendiagramm" → korrektes Chart
 - **DoD:** Datei → Analyse → Diagramm im Chat, Sandbox sicher isoliert
 - *Achtung: aufwändigster Task im MVP, sicherheitskritisch. Eigene Session, ggf. mehrere.*
 

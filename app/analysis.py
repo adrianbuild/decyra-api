@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
@@ -25,6 +26,8 @@ import pandas as pd
 
 from app import documents
 from app.sandbox.runner import SandboxResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -260,7 +263,39 @@ def generate_and_run(
         # pre-de-anon generated code) is recorded in the audit.
         run_code = anonymizer.deanonymize(code) if anonymizer is not None else code
 
-        result = runner.run(file_bytes=file_bytes, filename=filename, code=run_code)
+        try:
+            result = runner.run(file_bytes=file_bytes, filename=filename, code=run_code)
+        except Exception:  # noqa: BLE001 — infra fault, e.g. docker unreachable
+            # CONTAIN a non-timeout runner failure (the sandbox itself raised —
+            # docker binary/daemon unreachable, spawn failure, …). Retrying a
+            # broken runtime won't help, so we record EXACTLY ONE failed execution
+            # and stop. This keeps BOTH contracts the endpoint relies on: the
+            # caller returns a friendly HTTP 200 (never a 500 with a raw exception)
+            # AND writes exactly one code_execution_events row for the attempt.
+            # PII discipline holds: the audit stores the GENERATED ``code``
+            # (placeholders in strict), NEVER the raw exception (it may carry
+            # environment detail) and NEVER the de-anonymised ``run_code``. The
+            # exception text goes to the operational log ONLY — never to the audit,
+            # the user, or the LLM.
+            logger.warning(
+                "sandbox runner unavailable — analysis infra_error (attempt %d)",
+                attempt,
+                exc_info=True,
+            )
+            executions.append(
+                ExecutionRecord(
+                    generated_code=code, status="infra_error", chart_sha256=None
+                )
+            )
+            return CodegenOutcome(
+                ok=False,
+                chart_png=None,
+                attempts=attempt,
+                status="infra_error",
+                error_feedback="",
+                last_output="",
+                executions=executions,
+            )
         last_result = result
 
         chart_sha256 = (

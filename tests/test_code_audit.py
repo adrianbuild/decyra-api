@@ -423,9 +423,12 @@ async def test_audit_stores_generated_not_executed_code_strict(
     ).scalars().all()
     assert len(stored) == 1
     gen = stored[0]
-    # The audit holds the ANONYMISED/GENERATED code: placeholder present...
-    assert "[[DCY_PERSON_0]]" in gen
-    # ...and the raw PII column name is ABSENT (no PII at rest).
+    # THE ROBUST INVARIANT: the raw PII column name is ABSENT from the stored code
+    # (no PII at rest) — regardless of HOW the model addressed the column. Here the
+    # model used the placeholder, so it happens to be present; the test does NOT
+    # require it (a model may address the column positionally via df.columns[0],
+    # producing neither the raw name nor a placeholder — see the sibling test
+    # test_audit_no_raw_pii_when_llm_uses_columns_index_strict).
     assert "Mustermann" not in gen
 
     # No column anywhere stores the de-anonymisation map (placeholder -> real).
@@ -447,6 +450,49 @@ async def test_audit_stores_generated_not_executed_code_strict(
     ).one()
     assert "Mustermann" not in (full.generated_code or "")
     assert "Mustermann" not in (full.chart_sha256 or "")
+
+
+@pytest.mark.asyncio
+async def test_audit_no_raw_pii_when_llm_uses_columns_index_strict(
+    client, db, make_token, stub_pii, stub_analyze, stub_llm, stub_sandbox
+) -> None:
+    """Robustness for the no-PII-at-rest invariant (live-observed case): in strict
+    mode the model may address the PII column POSITIONALLY (``df.columns[0]``),
+    producing code with NEITHER the placeholder NOR the raw name. The invariant is
+    still that the raw PII name appears NOWHERE in the audit event — proven by a
+    full-text check across all columns, not by requiring a placeholder token."""
+    _seed_endpoint(db)
+    db.execute(
+        text("UPDATE workspaces SET settings = '{\"pii_mode\":\"strict\"}'::jsonb "
+             "WHERE id IN (SELECT workspace_id FROM workspace_members "
+             "WHERE user_id = :u)"),
+        {"u": USER_A},
+    )
+    stub_pii.state["force"] = "detected"
+    stub_analyze.state["spans_for"] = {"Mustermann": "PERSON"}
+    token = make_token(sub=USER_A, email="a@firma.de")
+
+    # Positional column access: neither a placeholder nor the raw name appears.
+    stub_llm.state["content"] = "df[df.columns[0]].plot()\nplt.savefig(CHART_PATH)\n"
+    stub_sandbox.state["status"] = "ok"
+    stub_sandbox.state["chart_png"] = b"\x89PNG_ok"
+
+    csv = b"Mustermann,umsatz\nA,10\nB,20\n"
+    r = await client.post(
+        "/v1/chat/completions", headers=_auth(token),
+        **_multipart(csv, content="Umsatz pro Person"),
+    )
+    assert r.status_code == 200, r.text
+
+    # Full-text: the raw PII name is NOWHERE in the whole audit event.
+    row = db.execute(
+        text("SELECT generated_code, chart_sha256, status, event_type "
+             "FROM code_execution_events")
+    ).one()
+    for field_val in (row.generated_code, row.chart_sha256, row.status, row.event_type):
+        assert "Mustermann" not in (field_val or "")
+    # In this case the code has neither the raw name nor a placeholder (correct).
+    assert "[[DCY_PERSON_0]]" not in row.generated_code
 
 
 @pytest.mark.asyncio
@@ -511,6 +557,61 @@ async def test_endpoint_one_event_per_execution_three_errors(
         text("SELECT status FROM code_execution_events")
     ).scalars().all()
     assert statuses == ["error", "error", "error"]
+
+
+@pytest.mark.asyncio
+async def test_endpoint_runner_infra_error_contained_one_event(
+    client, db, make_token, stub_pii, stub_llm, monkeypatch
+) -> None:
+    """Cross-cutting seam (review finding): a NON-timeout exception from the
+    sandbox runner (e.g. the ``docker`` binary is missing / unspawnable) must be
+    CONTAINED. Both contracts hold at this seam:
+      * error contract — a friendly HTTP 200 (NOT a 500), and no raw exception
+        text (``docker``/``FileNotFoundError``/``Errno``) anywhere in the body;
+      * audit contract — EXACTLY one code_execution_events row, status
+        'infra_error', never zero (dropped) and never double.
+    PII discipline holds too: the row stores the GENERATED code, never the raw
+    exception."""
+    from app.main import _ANALYSIS_FAILED_MSG
+    from app.sandbox import runner as runner_mod
+
+    _seed_endpoint(db)
+    token = make_token(sub=USER_A, email="a@firma.de")
+    stub_llm.state["content"] = "df.plot()\nplt.savefig(CHART_PATH)\n"
+
+    class _RaisingRunner:
+        def run(self, *, file_bytes, filename, code):
+            raise FileNotFoundError("[Errno 2] No such file or directory: 'docker'")
+
+    monkeypatch.setattr(
+        runner_mod, "get_sandbox_runner", lambda settings: _RaisingRunner()
+    )
+
+    r = await client.post(
+        "/v1/chat/completions", headers=_auth(token),
+        **_multipart(b"q,umsatz\nQ1,10\n", content="balken"),
+    )
+
+    # Contract 1: friendly 200, not 500; no raw exception leaked into the body.
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["decyra"]["analysis_status"] == "infra_error"
+    assert body["decyra"]["error"] == _ANALYSIS_FAILED_MSG
+    dumped = json.dumps(body)
+    for leak in ("docker", "FileNotFoundError", "Errno", "Traceback"):
+        assert leak not in dumped, f"raw exception detail leaked into body: {leak}"
+
+    # Contract 2: EXACTLY one audit event, status infra_error, generated code kept,
+    # no raw exception stored.
+    rows = db.execute(
+        text("SELECT status, generated_code, chart_sha256 FROM code_execution_events")
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].status == "infra_error"
+    assert rows[0].generated_code.strip() != ""
+    assert rows[0].chart_sha256 is None
+    for leak in ("docker", "FileNotFoundError", "Errno"):
+        assert leak not in rows[0].generated_code
 
 
 @pytest.mark.parametrize("bad_status", ["error", "timeout", "killed", "no_chart"])
